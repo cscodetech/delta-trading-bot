@@ -2,5 +2,6 @@ flask>=3.0
 pandas>=2.0
 numpy>=1.24
 cryptography
+pymsql
 requests>=2.31
 python-dotenv>=1.0
