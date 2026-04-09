@@ -86,10 +86,11 @@ class DeltaClient:
 
                 resp = self.session.get(url, params=params, headers=headers, timeout=10)
                 if resp.status_code >= 400:
-                    log.warning(f"  API GET {path} response [{resp.status_code}]: {_snippet(resp)}")
+                    snip = _snippet(resp)
+                    log.warning(f"  API GET {path} response [{resp.status_code}]: {snip}")
                     # Don't retry auth failures (usually invalid keys, wrong net, or IP whitelist)
                     if resp.status_code in (401, 403):
-                        resp.raise_for_status()
+                        raise RuntimeError(f"{resp.status_code} Unauthorized: {snip or resp.reason}")
                 resp.raise_for_status()
                 return resp.json()
             except requests.exceptions.HTTPError as e:
@@ -118,9 +119,10 @@ class DeltaClient:
                     headers=headers, timeout=10
                 )
                 if resp.status_code >= 400:
-                    log.warning(f"  API {path} response [{resp.status_code}]: {resp.text[:300]}")
+                    snip = (resp.text or "").strip().replace("\n", " ")[:500]
+                    log.warning(f"  API {path} response [{resp.status_code}]: {snip}")
                     if resp.status_code in (401, 403):
-                        resp.raise_for_status()
+                        raise RuntimeError(f"{resp.status_code} Unauthorized: {snip or resp.reason}")
                 resp.raise_for_status()
                 return resp.json()
             except requests.exceptions.RequestException as e:
@@ -138,10 +140,14 @@ class DeltaClient:
             headers=headers, timeout=10
         )
         if resp.status_code >= 400:
+            snip = ""
             try:
-                log.warning(f"  API DELETE {path} response [{resp.status_code}]: {(resp.text or '')[:300]}")
+                snip = (resp.text or "").strip().replace("\n", " ")[:500]
+                log.warning(f"  API DELETE {path} response [{resp.status_code}]: {snip}")
             except Exception:
                 pass
+            if resp.status_code in (401, 403):
+                raise RuntimeError(f"{resp.status_code} Unauthorized: {snip or resp.reason}")
         resp.raise_for_status()
         return resp.json()
 
@@ -215,6 +221,12 @@ class DeltaClient:
         """Return total USDT balance."""
         try:
             data = self._get("/v2/wallet/balances", auth=True)
+        except RuntimeError as e:
+            msg = str(e)
+            if msg.startswith("401") or msg.startswith("403"):
+                raise
+            log.warning(f"  Failed to fetch wallet balance: {e}")
+            return 0.0
         except requests.exceptions.HTTPError as e:
             status = getattr(getattr(e, "response", None), "status_code", None)
             if status in (401, 403):
@@ -238,6 +250,12 @@ class DeltaClient:
         """Return available (free) USDT balance for new positions."""
         try:
             data = self._get("/v2/wallet/balances", auth=True)
+        except RuntimeError as e:
+            msg = str(e)
+            if msg.startswith("401") or msg.startswith("403"):
+                raise
+            log.warning(f"  Failed to fetch available balance: {e}")
+            return 0.0
         except requests.exceptions.HTTPError as e:
             status = getattr(getattr(e, "response", None), "status_code", None)
             if status in (401, 403):

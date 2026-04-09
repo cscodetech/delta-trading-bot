@@ -1585,6 +1585,8 @@ async function refreshStatus() {
     alertEl.textContent = '';
   }
 
+  const needsSetup = !!s.error;
+
   $('testnet-badge').innerHTML = s.testnet
     ? '<span class="badge yellow">TESTNET</span>'
     : '<span class="badge red">LIVE</span>';
@@ -1651,12 +1653,16 @@ async function refreshStatus() {
   if (s.bot_running) {
     botBtn.textContent = 'Stop Bot';
     botBtn.className = 'btn btn-red btn-sm';
+    botBtn.disabled = false;
     $('bot-status').innerHTML = `<span class="dot on"></span> Running (PID ${s.bot_pid}) since ${s.bot_started_at}`;
   } else {
     botBtn.textContent = 'Start Bot';
     botBtn.className = 'btn btn-green btn-sm';
+    botBtn.disabled = needsSetup;
     $('bot-status').innerHTML = '<span class="dot off"></span> Stopped';
   }
+  const syncBtn = $('sync-btn');
+  if (syncBtn) syncBtn.disabled = needsSetup;
   $('mtpd-input').value = s.max_trades_per_day;
   $('today-trades').textContent = `Today: ${s.today_trades} / ${s.max_trades_per_day}`;
 }
