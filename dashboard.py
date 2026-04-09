@@ -490,6 +490,12 @@ def api_status():
             )
         err = msg
 
+    bot_running_any = bool(bot_mgr.running)
+    bot_owner_user_id = bot_mgr.user_id if bot_running_any else None
+    bot_owner_username = bot_mgr.started_by_username if bot_running_any else ""
+    bot_for_current_user = bool(bot_running_any and int(bot_mgr.user_id or 0) == int(uid or 0))
+    bot_locked = bool(bot_running_any and (not bot_for_current_user) and (not current_is_admin()))
+
     return jsonify({
         "balance": round(bal, 4),
         "available_balance": round(avail_bal, 4),
@@ -507,12 +513,15 @@ def api_status():
         "sl_pct": monitor.sl_pct,
         "tp_pct": monitor.tp_pct,
         "testnet": _parse_bool(db.get_user_setting(uid, "testnet", "1") or "1"),
-        "bot_running": bot_mgr.running,
+        # Bot status is user-wise. Only the owner (or admin) sees it as "running" to avoid confusion.
+        "bot_running": bool(bot_for_current_user or (current_is_admin() and bot_running_any)),
+        "bot_running_any": bot_running_any,
+        "bot_locked": bot_locked,
         "bot_started_at": bot_mgr.started_at,
         "bot_pid": bot_mgr.process.pid if bot_mgr.running else None,
-        "bot_user_id": bot_mgr.user_id,
+        "bot_user_id": bot_owner_user_id,
         "bot_started_by_user_id": bot_mgr.started_by_user_id,
-        "bot_started_by_username": bot_mgr.started_by_username,
+        "bot_started_by_username": bot_owner_username,
         "max_trades_per_day": bot_mgr.max_trades_per_day,
         "today_trades": db.get_today_trade_count(user_id=uid),
         "user_id": uid,
@@ -1650,7 +1659,14 @@ async function refreshStatus() {
 
   // Bot controls
   const botBtn = $('bot-toggle');
-  if (s.bot_running) {
+  const botLocked = !!s.bot_locked;
+  if (botLocked) {
+    botBtn.textContent = 'Bot Busy';
+    botBtn.className = 'btn btn-red btn-sm';
+    botBtn.disabled = true;
+    const by = s.bot_started_by_username ? ` by ${escapeHtml(s.bot_started_by_username)}` : '';
+    $('bot-status').innerHTML = `<span class="dot on"></span> Running${by} (locked)`;
+  } else if (s.bot_running) {
     botBtn.textContent = 'Stop Bot';
     botBtn.className = 'btn btn-red btn-sm';
     botBtn.disabled = false;
