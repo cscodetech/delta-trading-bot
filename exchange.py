@@ -66,7 +66,16 @@ class DeltaClient:
     # ── HTTP helpers with retry ──────────────────────────────────────────────
 
     def _get(self, path: str, params: dict = None, auth: bool = False) -> dict:
+        def _snippet(r: requests.Response) -> str:
+            try:
+                t = (r.text or "").strip().replace("\n", " ")
+                return t[:500]
+            except Exception:
+                return ""
+
         url = self.base_url + path
+        last_err: Exception | None = None
+
         for attempt in range(config.API_RETRY_COUNT):
             try:
                 if auth:
@@ -74,16 +83,30 @@ class DeltaClient:
                     headers = self._sign("GET", path, query_string=qs)
                 else:
                     headers = {}
-                resp = self.session.get(url, params=params,
-                                        headers=headers, timeout=10)
+
+                resp = self.session.get(url, params=params, headers=headers, timeout=10)
+                if resp.status_code >= 400:
+                    log.warning(f"  API GET {path} response [{resp.status_code}]: {_snippet(resp)}")
+                    # Don't retry auth failures (usually invalid keys, wrong net, or IP whitelist)
+                    if resp.status_code in (401, 403):
+                        resp.raise_for_status()
                 resp.raise_for_status()
                 return resp.json()
-            except requests.exceptions.RequestException as e:
-                if attempt < config.API_RETRY_COUNT - 1:
-                    log.warning(f"  API GET {path} failed (attempt {attempt+1}): {e}")
-                    time.sleep(config.API_RETRY_DELAY)
-                else:
+            except requests.exceptions.HTTPError as e:
+                last_err = e
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status in (401, 403):
                     raise
+            except requests.exceptions.RequestException as e:
+                last_err = e
+
+            if attempt < config.API_RETRY_COUNT - 1:
+                log.warning(f"  API GET {path} failed (attempt {attempt+1}): {last_err}")
+                time.sleep(config.API_RETRY_DELAY)
+
+        if last_err:
+            raise last_err
+        raise RuntimeError(f"API GET {path} failed")
 
     def _post(self, path: str, body: dict) -> dict:
         payload = json.dumps(body)
@@ -96,6 +119,8 @@ class DeltaClient:
                 )
                 if resp.status_code >= 400:
                     log.warning(f"  API {path} response [{resp.status_code}]: {resp.text[:300]}")
+                    if resp.status_code in (401, 403):
+                        resp.raise_for_status()
                 resp.raise_for_status()
                 return resp.json()
             except requests.exceptions.RequestException as e:
@@ -112,6 +137,11 @@ class DeltaClient:
             self.base_url + path, data=payload,
             headers=headers, timeout=10
         )
+        if resp.status_code >= 400:
+            try:
+                log.warning(f"  API DELETE {path} response [{resp.status_code}]: {(resp.text or '')[:300]}")
+            except Exception:
+                pass
         resp.raise_for_status()
         return resp.json()
 
@@ -182,32 +212,47 @@ class DeltaClient:
     # ── Account & Wallet ─────────────────────────────────────────────────────
 
     def get_wallet_balance(self) -> float:
-        """Return total USDT balance. Returns 0 on failure."""
+        """Return total USDT balance."""
         try:
             data = self._get("/v2/wallet/balances", auth=True)
-            balances = data.get("result", [])
-            for b in balances:
-                asset = b.get("asset_symbol", "").upper()
-                if asset in ("USDT", "USD"):
-                    return float(b.get("balance", 0))
-            # If specific asset not found, return first balance
-            if balances:
-                return float(balances[0].get("balance", 0))
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status in (401, 403):
+                raise
+            log.warning(f"  Failed to fetch wallet balance: {e}")
+            return 0.0
         except Exception as e:
             log.warning(f"  Failed to fetch wallet balance: {e}")
+            return 0.0
+
+        balances = data.get("result", [])
+        for b in balances:
+            asset = b.get("asset_symbol", "").upper()
+            if asset in ("USDT", "USD"):
+                return float(b.get("balance", 0))
+        if balances:
+            return float(balances[0].get("balance", 0))
         return 0.0
 
     def get_available_balance(self) -> float:
         """Return available (free) USDT balance for new positions."""
         try:
             data = self._get("/v2/wallet/balances", auth=True)
-            balances = data.get("result", [])
-            for b in balances:
-                asset = b.get("asset_symbol", "").upper()
-                if asset in ("USDT", "USD"):
-                    return float(b.get("available_balance", 0))
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status in (401, 403):
+                raise
+            log.warning(f"  Failed to fetch available balance: {e}")
+            return 0.0
         except Exception as e:
             log.warning(f"  Failed to fetch available balance: {e}")
+            return 0.0
+
+        balances = data.get("result", [])
+        for b in balances:
+            asset = b.get("asset_symbol", "").upper()
+            if asset in ("USDT", "USD"):
+                return float(b.get("available_balance", 0))
         return 0.0
 
     def get_positions(self) -> list:
@@ -254,7 +299,7 @@ class DeltaClient:
         return resp
 
     def place_limit_order(self, product_id: int, side: str,
-                          qty: int, price: float) -> dict:
+                          qty: int, price: float, symbol: str = "") -> dict:
         body = {
             "product_id":  product_id,
             "side":        side.lower(),
@@ -262,7 +307,30 @@ class DeltaClient:
             "size":        qty,
             "limit_price": str(price),
         }
-        return self._post("/v2/orders", body)
+        resp = self._post("/v2/orders", body)
+
+        # Track order in database (so Dashboard can show open orders)
+        order_id = 0
+        try:
+            result = resp.get("result", {})
+            order_id = int(result.get("id", 0))
+            if order_id:
+                db.insert_order({
+                    "order_id": order_id,
+                    "product_id": product_id,
+                    "symbol": symbol or "",
+                    "side": side.upper(),
+                    "order_type": "limit_order",
+                    "size": qty,
+                    "price": float(price) if price is not None else None,
+                    "status": result.get("state", "open"),
+                    "fill_price": float(result.get("average_fill_price", 0) or 0),
+                    "response_json": json.dumps(result)[:500],
+                })
+        except Exception as e:
+            log.warning(f"  Order tracking failed: {e}")
+
+        return resp
 
     def cancel_order(self, order_id: int, product_id: int) -> dict:
         body = {"id": order_id, "product_id": product_id}
@@ -277,21 +345,85 @@ class DeltaClient:
     def poll_order_status(self, order_id: int, product_id: int) -> dict:
         """Check current status of an order and update the database."""
         try:
-            data = self._get("/v2/orders",
-                             params={"product_id": product_id}, auth=True)
-            orders = data.get("result", [])
+            def _filled_size(payload: dict) -> int:
+                for k in ("filled_size", "filled_qty", "filled_quantity", "filled"):
+                    if k in payload and payload.get(k) is not None:
+                        try:
+                            return int(float(payload.get(k) or 0))
+                        except Exception:
+                            pass
+                return 0
+
+            # 1) Open orders endpoint
+            data = self._get("/v2/orders", params={"product_id": product_id}, auth=True)
+            orders = data.get("result", []) or []
             for o in orders:
-                if int(o.get("id", 0)) == order_id:
-                    status = o.get("state", "unknown")
+                if int(o.get("id", 0) or 0) == int(order_id):
+                    status = str(o.get("state", "unknown") or "unknown").lower()
                     fill_price = float(o.get("average_fill_price", 0) or 0)
-                    db.update_order_status(order_id, status, fill_price)
-                    return {"status": status, "fill_price": fill_price}
-            # If not in open orders, it's likely filled
-            db.update_order_status(order_id, "filled")
-            return {"status": "filled", "fill_price": 0}
+                    filled_sz = _filled_size(o)
+                    db.update_order_status(order_id, status, fill_price if fill_price else None)
+                    return {"status": status, "fill_price": fill_price, "filled_size": filled_sz}
+
+            # 2) Order history endpoint (cancelled/filled/rejected/etc)
+            try:
+                history = self.get_order_history(page_size=50) or []
+                for o in history:
+                    if int(o.get("id", 0) or 0) == int(order_id):
+                        status = str(o.get("state", "unknown") or "unknown").lower()
+                        fill_price = float(o.get("average_fill_price", 0) or 0)
+                        filled_sz = _filled_size(o)
+                        if filled_sz == 0 and status in ("filled", "closed"):
+                            try:
+                                filled_sz = int(float(o.get("size", 0) or 0))
+                            except Exception:
+                                filled_sz = 0
+                        db.update_order_status(order_id, status, fill_price if fill_price else None)
+                        return {"status": status, "fill_price": fill_price, "filled_size": filled_sz}
+            except Exception:
+                pass
+
+            # 3) Fills endpoint (best-effort fallback)
+            try:
+                fills = self.get_fills(page_size=100) or []
+                rel = []
+                for f in fills:
+                    oid = f.get("order_id")
+                    if oid is None and isinstance(f.get("order"), dict):
+                        oid = f["order"].get("id")
+                    try:
+                        if int(oid or 0) == int(order_id):
+                            rel.append(f)
+                    except Exception:
+                        continue
+
+                if rel:
+                    qty = 0.0
+                    notional = 0.0
+                    for f in rel:
+                        p = f.get("price") or f.get("fill_price") or f.get("average_fill_price")
+                        s = f.get("size") or f.get("qty") or f.get("filled_size")
+                        try:
+                            fp = float(p or 0)
+                            fs = float(s or 0)
+                        except Exception:
+                            continue
+                        if fp <= 0 or fs <= 0:
+                            continue
+                        qty += fs
+                        notional += fp * fs
+                    avg = (notional / qty) if qty > 0 else 0.0
+                    if qty > 0:
+                        db.update_order_status(order_id, "filled", avg if avg else None)
+                        return {"status": "filled", "fill_price": float(avg), "filled_size": int(qty)}
+            except Exception:
+                pass
+
+            # Unknown (do not assume filled)
+            return {"status": "unknown", "fill_price": 0, "filled_size": 0}
         except Exception as e:
             log.warning(f"  Order poll failed for {order_id}: {e}")
-            return {"status": "unknown", "fill_price": 0}
+            return {"status": "unknown", "fill_price": 0, "filled_size": 0}
 
     # ── Trade History ────────────────────────────────────────────────────────
 

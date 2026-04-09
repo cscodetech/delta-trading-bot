@@ -21,11 +21,16 @@ def get_tradable_symbols(client: DeltaClient) -> list[dict]:
     """Fetch all active USDT perpetual contracts from Delta Exchange."""
     data = client._get("/v2/products")
     products = data.get("result", [])
+    blacklist = set(getattr(config, 'SYMBOL_BLACKLIST', []))
     tradable = []
     for p in products:
         symbol = p.get("symbol", "")
         state  = p.get("state", "")
         ptype  = p.get("contract_type", "")
+        # Skip blacklisted symbols
+        if symbol in blacklist:
+            log.debug(f"  Skipping blacklisted symbol: {symbol}")
+            continue
         # Only active perpetual contracts
         if (state == "live" and
                 "perpetual" in ptype.lower()):
@@ -34,7 +39,7 @@ def get_tradable_symbols(client: DeltaClient) -> list[dict]:
                 "product_id": p["id"],
                 "name":       p.get("description", symbol),
             })
-    log.info(f"Found {len(tradable)} active USDT perpetual contracts.")
+    log.info(f"Found {len(tradable)} active USDT perpetual contracts (after blacklist).")
     return tradable
 
 

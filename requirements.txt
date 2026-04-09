@@ -1,7 +1,10 @@
-flask>=3.0
-pandas>=2.0
-numpy>=1.24
+anthropic>=0.40
 cryptography
+flask>=3.0
+google-generativeai>=0.8
+numpy>=1.24
+pandas>=2.0
 pymysql
-requests>=2.31
 python-dotenv>=1.0
+requests>=2.31
+waitress>=3.0

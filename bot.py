@@ -34,6 +34,11 @@ from strategies import (
 from risk_manager import RiskManager, TradeRecord
 import alerts
 
+try:
+    from ai_brain import AIBrain
+except Exception:
+    AIBrain = None
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -54,6 +59,8 @@ class Position:
 
     def __init__(self):
         self.active: bool = False
+        self.filled: bool = False   # True only after entry order is filled
+        self.pending: bool = False  # True while entry order is working
         self.side: str = ""         # "BUY" or "SELL"
         self.entry_price: float = 0.0
         self.size: int = 0
@@ -66,13 +73,23 @@ class Position:
         self.entry_tick: int = 0
         self.partial_taken: bool = False
         self.order_id: int = 0
+        self.close_order_id: int = 0
+        self.order_type: str = ""
+        self.pending_since_tick: int = 0
+        self.pending_limit_price: float | None = None
         self.regime: str = ""
         self.confirmations: int = 0
         self.strategies_used: list[str] = []
 
     def open(self, side: str, price: float, size: int, product_id: int,
-             symbol: str, sl_tp: dict, tick: int):
+             symbol: str, sl_tp: dict, tick: int,
+             order_id: int = 0,
+             order_type: str = "market_order",
+             pending: bool = False,
+             pending_limit_price: float | None = None):
         self.active = True
+        self.pending = bool(pending)
+        self.filled = not self.pending
         self.side = side
         self.entry_price = price
         self.size = size
@@ -83,18 +100,48 @@ class Position:
         self.trail_distance = sl_tp["trail_distance"]
         self.entry_tick = tick
         self.partial_taken = False
-        self.order_id = 0
+        self.order_id = int(order_id or 0)
+        self.order_type = order_type or ""
+        self.pending_since_tick = tick if self.pending else 0
+        self.pending_limit_price = pending_limit_price if self.pending else None
+        self.close_order_id = 0
+
+        if self.filled:
+            self._init_trailing(price)
+
+    def mark_filled(self, fill_price: float, tick: int, sl_tp: dict):
+        """Transition a pending entry into a live filled position."""
+        self.pending = False
+        self.filled = True
+        self.pending_since_tick = 0
+        self.pending_limit_price = None
+        self.entry_price = float(fill_price or self.entry_price)
+        self.entry_tick = tick
+        self.sl_price = sl_tp["sl_price"]
+        self.tp_price = sl_tp["tp_price"]
+        self.trail_distance = sl_tp["trail_distance"]
+        self.partial_taken = False
+        self._init_trailing(self.entry_price)
+
+    def _init_trailing(self, price: float):
         # Init trailing stop
-        if side == "BUY":
+        if self.side == "BUY":
             self.trail_price = price - self.trail_distance
         else:
             self.trail_price = price + self.trail_distance
 
     def close(self):
         self.active = False
+        self.filled = False
+        self.pending = False
         self.side = ""
         self.entry_price = 0.0
         self.size = 0
+        self.order_id = 0
+        self.close_order_id = 0
+        self.order_type = ""
+        self.pending_since_tick = 0
+        self.pending_limit_price = None
 
     def pnl_pct(self, current_price: float) -> float:
         if self.side == "BUY":
@@ -134,6 +181,12 @@ class TradingBot:
         self.client = DeltaClient(config.API_KEY, config.API_SECRET,
                                   testnet=config.TESTNET)
         self.risk = RiskManager()
+        self.ai = None
+        if AIBrain:
+            try:
+                self.ai = AIBrain()
+            except Exception as e:
+                log.warning(f"AI init deferred: {e}")
         self.positions: dict[str, Position] = {}  # symbol -> Position
         self.tick = 0
         self.last_report_date: date | None = None
@@ -181,6 +234,8 @@ class TradingBot:
                          f"size={abs(size)} entry={entry_price}")
                 pos = Position()
                 pos.active = True
+                pos.filled = True
+                pos.pending = False
                 pos.side = side
                 pos.entry_price = entry_price
                 pos.size = abs(size)
@@ -268,6 +323,61 @@ class TradingBot:
             log.warning(f"  Failed to fetch {tf} candles for {symbol}: {e}")
             return None
 
+    def _orderbook_levels(self, product_id: int) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+        """
+        Return (bids, asks) where each is list[(price, size)] sorted best-first.
+        Robust to varying Delta payload shapes.
+        """
+        ob = self.client.get_orderbook(product_id)
+        bids_raw = ob.get("buy") or ob.get("bids") or []
+        asks_raw = ob.get("sell") or ob.get("asks") or []
+
+        def _coerce(level) -> tuple[float, float] | None:
+            try:
+                if isinstance(level, (list, tuple)) and len(level) >= 2:
+                    return float(level[0]), float(level[1])
+                if isinstance(level, dict):
+                    p = level.get("price") or level.get("p")
+                    s = level.get("size") or level.get("qty") or level.get("q")
+                    if p is None or s is None:
+                        return None
+                    return float(p), float(s)
+            except Exception:
+                return None
+            return None
+
+        bids = [x for x in (_coerce(l) for l in bids_raw) if x and x[1] > 0]
+        asks = [x for x in (_coerce(l) for l in asks_raw) if x and x[1] > 0]
+        bids.sort(key=lambda x: x[0], reverse=True)
+        asks.sort(key=lambda x: x[0])
+        return bids, asks
+
+    def _liquidity_metrics(self, product_id: int, contract_value: float = 1.0) -> dict | None:
+        """Compute spread% and approximate top-of-book depth in USD."""
+        try:
+            bids, asks = self._orderbook_levels(product_id)
+            if not bids or not asks:
+                return None
+            best_bid = float(bids[0][0])
+            best_ask = float(asks[0][0])
+            mid = (best_bid + best_ask) / 2 if (best_bid + best_ask) > 0 else 0.0
+            spread_pct = ((best_ask - best_bid) / mid * 100) if mid > 0 else 999.0
+
+            levels = int(getattr(config, "BOOK_DEPTH_LEVELS", 5) or 5)
+            bid_depth = sum(p * s * contract_value for p, s in bids[:levels])
+            ask_depth = sum(p * s * contract_value for p, s in asks[:levels])
+
+            return {
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "spread_pct": float(spread_pct),
+                "bid_depth_usd": float(bid_depth),
+                "ask_depth_usd": float(ask_depth),
+            }
+        except Exception as e:
+            log.warning(f"  Liquidity metrics failed: {e}")
+            return None
+
     # ── Exit Logic ───────────────────────────────────────────
 
     def check_exits(self, pos: Position, current_price: float) -> str | None:
@@ -277,14 +387,23 @@ class TradingBot:
         """
         if not pos.active:
             return None
+        if not getattr(pos, "filled", False):
+            return None
 
         pnl = pos.pnl_pct(current_price)
+        bars_held = self.tick - pos.entry_tick
+        min_hold = getattr(config, 'MIN_HOLD_BARS', 4)
 
-        # 1. Stop Loss
+        # 1. Stop Loss (always respected — capital protection, no hold time bypass)
         if pos.side == "BUY" and current_price <= pos.sl_price:
             return f"Stop Loss (PnL: {pnl:+.2f}%)"
         if pos.side == "SELL" and current_price >= pos.sl_price:
             return f"Stop Loss (PnL: {pnl:+.2f}%)"
+
+        # Enforce minimum hold time — prevents signal-flip churn & fee bleed
+        if bars_held < min_hold:
+            log.info(f"  {pos.symbol}: holding — only {bars_held}/{min_hold} bars elapsed")
+            return None
 
         # 2. Trailing Stop
         if config.TRAILING_STOP:
@@ -323,7 +442,6 @@ class TradingBot:
             return f"Take Profit (PnL: {pnl:+.2f}%)"
 
         # 4. Time-based exit
-        bars_held = self.tick - pos.entry_tick
         if bars_held >= config.TIME_EXIT_BARS:
             return f"Time Exit ({bars_held} bars, PnL: {pnl:+.2f}%)"
 
@@ -408,7 +526,7 @@ class TradingBot:
         # ── Filter 0d: Minimum ADX (trend strength) ─────────
         adx_val = regime_info.get("adx", 0)
         min_adx = getattr(config, 'MIN_ADX_ENTRY', 20)
-        if adx_val < min_adx:
+        if regime_info.get("regime") != MarketRegime.RANGING and adx_val < min_adx:
             log.info(f"  BLOCKED: ADX={adx_val:.1f} < {min_adx} "
                      f"(no clear trend — choppy market)")
             db.log_filter_block(symbol, "min_adx",
@@ -467,6 +585,7 @@ class TradingBot:
         confirm_ok = check_confirmation_tf(df_confirm, direction)
         agg = aggregate_signals(signals, regime_weights, trend_bias, confirm_ok)
         direction = agg["direction"]
+        rule_conf = float(agg.get("confidence", 0.0) or 0.0)
 
         # Log all penalty/block details
         for d in agg["details"]:
@@ -480,6 +599,60 @@ class TradingBot:
                                 f"score={agg['total_score']:.2f} after confirm/trend")
             return
 
+        # Extra safety after a losing streak: demand higher quality setups
+        try:
+            consec_losses = int(getattr(self.risk, "_consecutive_losses", 0))
+        except Exception:
+            consec_losses = 0
+        if consec_losses >= 2 and rule_conf < 0.72:
+            log.info(f"  BLOCKED: low confidence {rule_conf:.2f} during losing streak (L{consec_losses})")
+            db.log_filter_block(symbol, "quality_gate", f"conf={rule_conf:.2f} during L{consec_losses}")
+            return
+
+        # ── AI Decision Engine (optional) ────────────────────
+
+        ai_decision = None
+        if getattr(self, "ai", None) and db.get_setting("ai_enabled") == "1":
+            try:
+                ai_decision = self.ai.decide_ensemble(
+                    symbol=symbol,
+                    signals=signals,
+                    regime_info=regime_info,
+                    trend_bias=trend_bias,
+                    recent_trades=self.risk.trade_history[-10:],
+                    open_positions=list(self.positions.values()),
+                    account_balance=getattr(self.risk, "current_balance", 0.0),
+                    daily_pnl=(
+                        ((getattr(self.risk, "current_balance", 0.0) - getattr(self.risk, "_daily_start_balance", 0.0))
+                         / getattr(self.risk, "_daily_start_balance", 1.0) * 100)
+                        if getattr(self.risk, "_daily_start_balance", 0.0) > 0 else 0.0
+                    ),
+                )
+                if getattr(ai_decision, "provider", "") == "fallback":
+                    log.info(f"  AI [{symbol}]: provider unavailable — proceeding without AI gate")
+                    ai_decision = None
+                if ai_decision:
+                    for warning in ai_decision.warnings:
+                        log.warning(f"  AI warning [{symbol}]: {warning}")
+                    if ai_decision.action != "ENTER":
+                        log.info(f"  AI [{symbol}]: {ai_decision.action} — {ai_decision.reasoning}")
+                        db.log_filter_block(symbol, "ai_brain", ai_decision.reasoning)
+                        return
+                    if ai_decision.confidence < 0.60:
+                        log.info(f"  AI [{symbol}]: confidence {ai_decision.confidence:.0%} too low — skipping")
+                        db.log_filter_block(symbol, "ai_brain", f"low confidence: {ai_decision.confidence:.0%}")
+                        return
+                    if ai_decision.direction and ai_decision.direction != direction:
+                        log.info(
+                            f"  AI [{symbol}]: direction mismatch "
+                            f"(AI={ai_decision.direction}, signals={direction}) — skipping"
+                        )
+                        db.log_filter_block(symbol, "ai_brain", "direction mismatch")
+                        return
+            except Exception as e:
+                log.warning(f"  AI [{symbol}]: error — proceeding without AI ({e})")
+                ai_decision = None
+
         # Calculate ATR for sizing and SL/TP
         from market_detector import compute_atr
         atr = compute_atr(df_entry, config.ATR_PERIOD)
@@ -492,10 +665,38 @@ class TradingBot:
         avail_bal = self.client.get_available_balance()
         size = self.risk.calculate_size(current_price, atr_val, cval,
                                         available_balance=avail_bal)
-        log.info(f"  Sizing: available=${avail_bal:.2f}, contract_value={cval}, size={size}")
+        # Confidence-based scaling (ensemble AI)
+        if ai_decision and ai_decision.provider == "ensemble":
+            # Scale size: 0.6 = 80%, 0.7 = 100%, 0.8+ = 120%
+            conf = ai_decision.confidence
+            if conf < 0.65:
+                size = max(1, int(round(size * 0.8)))
+            elif conf < 0.75:
+                size = int(round(size * 1.0))
+            else:
+                size = int(round(size * 1.2))
+            log.info(f"  Confidence-based sizing: conf={conf:.2f}, final size={size}")
+        else:
+            # No paid AI: still scale slightly based on rule confidence
+            if rule_conf and rule_conf < 0.70:
+                size = max(1, int(round(size * 0.80)))
+            elif rule_conf and rule_conf >= 0.85:
+                size = max(1, int(round(size * 1.05)))
+            log.info(f"  Sizing: available=${avail_bal:.2f}, contract_value={cval}, size={size}, conf={rule_conf:.2f}")
 
-        # SL/TP calculation
-        sl_tp = self.risk.calculate_sl_tp(current_price, direction, atr_val)
+        # SL/TP calculation (adaptive)
+        volatility = regime_info.get("atr_pct", None)
+        ai_conf = ai_decision.confidence if ai_decision else (rule_conf if rule_conf > 0 else None)
+        sl_tp = self.risk.calculate_sl_tp(
+            current_price, direction, atr_val,
+            ai_confidence=ai_conf, volatility=volatility
+        )
+        if ai_decision:
+            if ai_decision.size_suggestion == "reduce":
+                size = max(1, int(round(size * 0.5)))
+            elif ai_decision.size_suggestion == "increase":
+                size = max(1, int(round(size * 1.3)))
+            log.info(f"  AI sizing/sl: size={size}, sl={ai_decision.sl_suggestion}, qty={ai_decision.size_suggestion}")
 
         # ── Filter: Quick backtest check ─────────────────────
         if getattr(config, 'BACKTEST_BEFORE_LIVE', False):
@@ -526,69 +727,132 @@ class TradingBot:
     def _open_position(self, symbol: str, product_id: int,
                        direction: str, price: float, size: int,
                        sl_tp: dict, confirmations: int, regime_info: dict,
-                       signals=None):
+                       signals=None, max_retries: int = 2):
         side = "buy" if direction == "BUY" else "sell"
         log.info(f"  Opening {direction} {symbol} | "
                  f"size={size} | price≈{price} | "
                  f"SL={sl_tp['sl_price']} | TP={sl_tp['tp_price']}")
+
+        # Liquidity / spread filter (prevents spread bleed in thin markets)
+        cval = 1.0
         try:
-            if config.PAPER_TRADING:
-                log.info("  [PAPER] Order simulated")
-                resp = {"result": {"id": "paper"}}
-            elif getattr(config, 'USE_LIMIT_ORDERS', False):
-                # Limit order: offset price slightly for better fill
-                offset = getattr(config, 'LIMIT_OFFSET_PCT', 0.02) / 100
-                if direction == "BUY":
-                    limit_price = price * (1 + offset)
-                else:
-                    limit_price = price * (1 - offset)
-                # Keep same precision as market price
-                price_str = f"{price}"
-                decimals = len(price_str.split('.')[-1]) if '.' in price_str else 2
-                limit_price = round(limit_price, max(decimals, 2))
-                log.info(f"  Using LIMIT order at {limit_price} "
-                         f"(offset={offset*100:.3f}%)")
-                resp = self.client.place_limit_order(
-                    product_id, side, size, limit_price)
-            else:
-                resp = self.client.place_market_order(
-                    product_id, side, size,
-                    symbol=symbol)
-            log.info(f"  Order response: {resp}")
-
-            pos = Position()
-            pos.open(direction, price, size, product_id,
-                     symbol, sl_tp, self.tick)
-
-            # Track order ID
-            order_id = 0
+            cv = self.client.get_contract_values()
+            cval = float(cv.get(symbol, 1.0) or 1.0)
+        except Exception:
+            pass
+        liq = self._liquidity_metrics(product_id, contract_value=cval)
+        if liq:
+            max_spread = float(getattr(config, "MAX_SPREAD_PCT", 0.0) or 0.0)
+            min_depth = float(getattr(config, "MIN_BOOK_DEPTH_USD", 0.0) or 0.0)
+            spread_pct = float(liq.get("spread_pct", 999.0))
+            depth_usd = min(float(liq.get("bid_depth_usd", 0.0)),
+                            float(liq.get("ask_depth_usd", 0.0)))
+            if max_spread > 0 and spread_pct > max_spread:
+                msg = f"Spread too wide: {spread_pct:.3f}% > {max_spread}%"
+                log.info(f"  BLOCKED: {symbol} {msg}")
+                db.log_filter_block(symbol, "liquidity", msg)
+                return
+            if min_depth > 0 and depth_usd < min_depth:
+                msg = f"Orderbook depth too low: {depth_usd:,.0f} < {min_depth:,.0f} USD"
+                log.info(f"  BLOCKED: {symbol} {msg}")
+                db.log_filter_block(symbol, "liquidity", msg)
+                return
+        attempt = 0
+        while attempt <= max_retries:
             try:
-                order_id = int(resp.get("result", {}).get("id", 0))
-            except (ValueError, TypeError):
-                pass
-            pos.order_id = order_id
-            pos.regime = regime_info.get("regime", "")
-            pos.confirmations = confirmations
-            # Track which strategies contributed to this entry
-            if signals:
-                pos.strategies_used = [
-                    s.name for s in signals
-                    if s.direction == direction and s.strength > 0
-                ]
+                limit_price = None
+                if config.PAPER_TRADING:
+                    log.info("  [PAPER] Order simulated")
+                    resp = {"result": {"id": "paper"}}
+                elif getattr(config, 'USE_LIMIT_ORDERS', False):
+                    # Maker-ish limit: use top-of-book and stay inside spread (never cross).
+                    offset = float(getattr(config, 'LIMIT_OFFSET_PCT', 0.02) or 0.02) / 100.0
+                    best_bid = float(liq["best_bid"]) if liq else float(price)
+                    best_ask = float(liq["best_ask"]) if liq else float(price)
 
-            self.positions[symbol] = pos
+                    if direction == "BUY":
+                        target = best_bid * (1 + offset)  # closer to ask, still inside spread
+                        limit_price = min(target, best_ask * (1 - 1e-6))
+                        if limit_price >= best_ask or limit_price <= 0:
+                            limit_price = best_bid
+                    else:
+                        target = best_ask * (1 - offset)  # closer to bid, still inside spread
+                        limit_price = max(target, best_bid * (1 + 1e-6))
+                        if limit_price <= best_bid or limit_price <= 0:
+                            limit_price = best_ask
 
-            alerts.alert_entry(
-                symbol, direction, price, size,
-                sl_tp["sl_price"], sl_tp["tp_price"],
-                confirmations, regime_info["regime"],
-            )
-        except Exception as e:
-            log.error(f"  Failed to open {symbol}: {e}")
-            alerts.alert_error(f"Open position failed: {e}")
+                    # Keep same precision as market price
+                    price_str = f"{price}"
+                    decimals = len(price_str.split('.')[-1]) if '.' in price_str else 2
+                    limit_price = round(float(limit_price), max(decimals, 2))
+                    log.info(
+                        f"  Using LIMIT order at {limit_price} "
+                        f"(bid={best_bid}, ask={best_ask}, offset={offset*100:.3f}%)"
+                    )
+                    resp = self.client.place_limit_order(
+                        product_id, side, size, limit_price, symbol=symbol)
+                else:
+                    resp = self.client.place_market_order(
+                        product_id, side, size,
+                        symbol=symbol)
+                log.info(f"  Order response: {resp}")
+
+                # Track order ID + best fill estimate
+                order_id = 0
+                avg_fill = 0.0
+                try:
+                    result = resp.get("result", {}) if isinstance(resp, dict) else {}
+                    order_id = int(result.get("id", 0) or 0)
+                    avg_fill = float(result.get("average_fill_price", 0) or 0)
+                except Exception:
+                    order_id = 0
+                    avg_fill = 0.0
+
+                pos = Position()
+                is_limit = (not config.PAPER_TRADING) and getattr(config, 'USE_LIMIT_ORDERS', False)
+                if is_limit:
+                    pos.open(direction, float(price), size, product_id,
+                             symbol, sl_tp, self.tick,
+                             order_id=order_id, order_type="limit_order",
+                             pending=True,
+                             pending_limit_price=float(limit_price) if limit_price is not None else None)
+                else:
+                    fill_price = avg_fill if avg_fill > 0 else float(price)
+                    pos.open(direction, float(fill_price), size, product_id,
+                             symbol, sl_tp, self.tick,
+                             order_id=order_id, order_type="market_order",
+                             pending=False)
+                pos.regime = regime_info.get("regime", "")
+                pos.confirmations = confirmations
+                # Track which strategies contributed to this entry
+                if signals:
+                    pos.strategies_used = [
+                        s.name for s in signals
+                        if s.direction == direction and s.strength > 0
+                    ]
+
+                self.positions[symbol] = pos
+
+                if getattr(pos, "filled", False):
+                    alerts.alert_entry(
+                        symbol, direction, pos.entry_price, size,
+                        sl_tp["sl_price"], sl_tp["tp_price"],
+                        confirmations, regime_info["regime"],
+                    )
+                else:
+                    log.info(f"  Entry order working: {symbol} order_id={order_id} limit={pos.pending_limit_price}")
+                return
+            except Exception as e:
+                attempt += 1
+                log.error(f"  Failed to open {symbol} (attempt {attempt}/{max_retries+1}): {e}")
+                alerts.alert_error(f"Open position failed (attempt {attempt}): {e}")
+                time.sleep(2)
+        log.error(f"  All attempts to open {symbol} failed after {max_retries+1} tries.")
 
     def _close_position(self, pos: Position, reason: str):
         if not pos.active:
+            return
+        if not getattr(pos, "filled", False):
             return
 
         try:
@@ -613,15 +877,41 @@ class TradingBot:
                         close_resp.get("result", {}).get("id", 0))
                 except (ValueError, TypeError):
                     pass
+
+                # Prefer real fill price from response / polling
+                exit_price = current_price
+                try:
+                    avg_fill = float(close_resp.get("result", {}).get("average_fill_price", 0) or 0)
+                    if avg_fill > 0:
+                        exit_price = avg_fill
+                except Exception:
+                    pass
+                if close_order_id:
+                    try:
+                        polled = self.client.poll_order_status(close_order_id, pos.product_id) or {}
+                        fp = float(polled.get("fill_price") or 0)
+                        if fp > 0:
+                            exit_price = fp
+                    except Exception:
+                        pass
             else:
                 close_order_id = 0
+                exit_price = current_price
+
+            pnl = pos.pnl_pct(exit_price)
 
             record = TradeRecord(
                 symbol=pos.symbol,
                 side=pos.side,
                 entry_price=pos.entry_price,
-                exit_price=current_price,
+                exit_price=float(exit_price),
                 pnl_pct=pnl,
+                fee_pct=(
+                    (config.MAKER_FEE_PCT if getattr(pos, "order_type", "") == "limit_order" else config.TAKER_FEE_PCT)
+                    + config.TAKER_FEE_PCT
+                    + (0.0 if getattr(pos, "order_type", "") == "limit_order" else config.SLIPPAGE_PCT)
+                    + config.SLIPPAGE_PCT
+                ),
                 size=pos.size,
                 timestamp=time.time(),
                 reason=reason,
@@ -629,6 +919,7 @@ class TradingBot:
                 close_order_id=close_order_id,
                 regime=getattr(pos, 'regime', ''),
                 confirmations=getattr(pos, 'confirmations', 0),
+                contract_value=float(self.client.get_contract_values().get(pos.symbol, 1.0) or 1.0),
             )
             self.risk.record_trade(record)
 
@@ -654,7 +945,7 @@ class TradingBot:
 
             alerts.alert_exit(
                 pos.symbol, pos.side,
-                pos.entry_price, current_price, pnl, reason,
+                pos.entry_price, float(exit_price), pnl, reason,
             )
         except Exception as e:
             log.error(f"  Failed to close {pos.symbol}: {e}")
@@ -698,7 +989,7 @@ class TradingBot:
 
             # Track local product_ids
             local_pids = {pos.product_id for pos in self.positions.values()
-                          if pos.active}
+                          if pos.active and getattr(pos, "filled", False)}
 
             # Discover positions not tracked locally
             for pid, ep in active_pids.items():
@@ -712,6 +1003,8 @@ class TradingBot:
                             f"{side} {symbol} size={abs(size)}")
                 pos = Position()
                 pos.active = True
+                pos.filled = True
+                pos.pending = False
                 pos.side = side
                 pos.entry_price = entry_price
                 pos.size = abs(size)
@@ -734,6 +1027,8 @@ class TradingBot:
             closed_syms = []
             for sym, pos in self.positions.items():
                 if not pos.active:
+                    continue
+                if not getattr(pos, "filled", False):
                     continue
                 if pos.product_id not in active_pids:
                     log.warning(f"  {sym} closed externally — syncing")
@@ -781,6 +1076,7 @@ class TradingBot:
                     close_order_id=0,
                     regime=getattr(pos, 'regime', ''),
                     confirmations=getattr(pos, 'confirmations', 0),
+                    contract_value=float(self.client.get_contract_values().get(sym, 1.0) or 1.0),
                 )
                 self.risk.record_trade(record)
                 log.info(f"  Recorded {sym} external close: PnL={pnl:+.2f}%")
@@ -788,11 +1084,268 @@ class TradingBot:
                 pos.close()
                 del self.positions[sym]
 
-            # Poll pending orders
-            pending = db.get_pending_orders()
-            for o in pending:
-                self.client.poll_order_status(
-                    o["order_id"], o["product_id"])
+            # Poll pending/open orders and reconcile local pending entries
+            pending_rows = db.get_pending_orders()
+            status_by_id: dict[int, dict] = {}
+            for o in pending_rows:
+                try:
+                    oid = int(o.get("order_id") or 0)
+                    pid = int(o.get("product_id") or 0)
+                    if not oid or not pid:
+                        continue
+                    info = self.client.poll_order_status(oid, pid) or {}
+                    status_by_id[oid] = {"db": o, **info}
+                except Exception:
+                    continue
+
+            # Reconcile local pending entries (limit orders)
+            for sym, pos in list(self.positions.items()):
+                if not pos.active or not getattr(pos, "pending", False):
+                    continue
+
+                oid = int(getattr(pos, "order_id", 0) or 0)
+                info = status_by_id.get(oid, {})
+                status = str(info.get("status") or info.get("state") or "open").lower()
+
+                if status in ("filled", "closed"):
+                    fill_price = float(info.get("fill_price") or 0) or float(pos.pending_limit_price or pos.entry_price or 0)
+                    filled_size = int(info.get("filled_size") or info.get("filled_qty") or pos.size or 0)
+                    if filled_size > 0:
+                        pos.size = filled_size
+
+                    df_entry = self._fetch_candles(sym, config.TF_ENTRY, limit=200)
+                    atr_val = 0.0
+                    vol = None
+                    try:
+                        if df_entry is not None and len(df_entry) > 20:
+                            atr = compute_atr(df_entry, config.ATR_PERIOD)
+                            import numpy as _np
+                            atr_val = float(atr.iloc[-1]) if len(atr) > 0 and not _np.isnan(atr.iloc[-1]) else 0.0
+                            reg = detect_regime(df_entry)
+                            pos.regime = reg.get("regime", pos.regime)
+                            vol = reg.get("atr_pct", None)
+                    except Exception:
+                        atr_val = 0.0
+
+                    new_sl_tp = self.risk.calculate_sl_tp(
+                        float(fill_price), pos.side, float(atr_val),
+                        ai_confidence=None, volatility=vol
+                    )
+                    pos.mark_filled(float(fill_price), self.tick, new_sl_tp)
+
+                    log.info(f"  Entry filled: {sym} order_id={oid} fill={pos.entry_price}")
+                    alerts.alert_entry(
+                        sym, pos.side, pos.entry_price, pos.size,
+                        pos.sl_price, pos.tp_price,
+                        getattr(pos, "confirmations", 0),
+                        getattr(pos, "regime", ""),
+                    )
+                    continue
+
+                if status in ("cancelled", "rejected", "expired"):
+                    log.warning(f"  Pending entry aborted: {sym} order_id={oid} status={status}")
+                    symbol = pos.symbol
+                    pos.close()
+                    if symbol in self.positions:
+                        del self.positions[symbol]
+                    cooldown = getattr(config, 'SYMBOL_COOLDOWN', 5)
+                    if cooldown > 0:
+                        self.symbol_cooldowns[symbol] = self.tick + cooldown
+                    continue
+
+                # Stale limit: cancel and reprice or fall back to market
+                max_wait = int(getattr(config, "LIMIT_MAX_WAIT_TICKS", 0) or 0)
+                if max_wait > 0 and (self.tick - int(getattr(pos, "pending_since_tick", 0) or 0)) >= max_wait:
+                    try:
+                        log.info(f"  Stale limit, cancelling: {sym} order_id={oid}")
+                        self.client.cancel_order(oid, pos.product_id)
+                        try:
+                            db.update_order_status(oid, "cancelled")
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        log.warning(f"  Cancel failed for {sym} order_id={oid}: {e}")
+
+                    # Reprice or fallback
+                    try:
+                        cv = self.client.get_contract_values()
+                        cval = float(cv.get(sym, 1.0) or 1.0)
+                    except Exception:
+                        cval = 1.0
+                    liq2 = self._liquidity_metrics(pos.product_id, contract_value=cval)
+
+                    if not liq2:
+                        if getattr(config, "LIMIT_FALLBACK_MARKET", True):
+                            resp_m = self.client.place_market_order(
+                                pos.product_id,
+                                "buy" if pos.side == "BUY" else "sell",
+                                pos.size,
+                                symbol=sym,
+                            )
+                            new_oid = 0
+                            fill_price = float(pos.entry_price or 0)
+                            try:
+                                r = resp_m.get("result", {}) if isinstance(resp_m, dict) else {}
+                                new_oid = int(r.get("id", 0) or 0)
+                                fp = float(r.get("average_fill_price", 0) or 0)
+                                if fp > 0:
+                                    fill_price = fp
+                            except Exception:
+                                pass
+
+                            df_entry = self._fetch_candles(sym, config.TF_ENTRY, limit=200)
+                            atr_val = 0.0
+                            vol = None
+                            try:
+                                if df_entry is not None and len(df_entry) > 20:
+                                    atr = compute_atr(df_entry, config.ATR_PERIOD)
+                                    import numpy as _np
+                                    atr_val = float(atr.iloc[-1]) if len(atr) > 0 and not _np.isnan(atr.iloc[-1]) else 0.0
+                                    reg = detect_regime(df_entry)
+                                    pos.regime = reg.get("regime", pos.regime)
+                                    vol = reg.get("atr_pct", None)
+                            except Exception:
+                                atr_val = 0.0
+
+                            new_sl_tp = self.risk.calculate_sl_tp(float(fill_price), pos.side, float(atr_val), volatility=vol)
+                            pos.order_id = new_oid
+                            pos.order_type = "market_order"
+                            pos.mark_filled(float(fill_price), self.tick, new_sl_tp)
+                            alerts.alert_entry(
+                                sym, pos.side, pos.entry_price, pos.size,
+                                pos.sl_price, pos.tp_price,
+                                getattr(pos, "confirmations", 0),
+                                getattr(pos, "regime", ""),
+                            )
+                        continue
+
+                    offset = float(getattr(config, 'LIMIT_OFFSET_PCT', 0.02) or 0.02) / 100.0
+                    best_bid = float(liq2["best_bid"])
+                    best_ask = float(liq2["best_ask"])
+                    if pos.side == "BUY":
+                        target = best_bid * (1 + offset)
+                        new_limit = min(target, best_ask * (1 - 1e-6))
+                        if new_limit >= best_ask or new_limit <= 0:
+                            new_limit = best_bid
+                    else:
+                        target = best_ask * (1 - offset)
+                        new_limit = max(target, best_bid * (1 + 1e-6))
+                        if new_limit <= best_bid or new_limit <= 0:
+                            new_limit = best_ask
+
+                    mid = (best_bid + best_ask) / 2 if (best_bid + best_ask) > 0 else float(new_limit)
+                    price_str = f"{mid}"
+                    decimals = len(price_str.split('.')[-1]) if '.' in price_str else 2
+                    new_limit = round(float(new_limit), max(decimals, 2))
+
+                    if getattr(config, "LIMIT_REPRICE", True):
+                        try:
+                            resp2 = self.client.place_limit_order(
+                                pos.product_id,
+                                "buy" if pos.side == "BUY" else "sell",
+                                pos.size,
+                                new_limit,
+                                symbol=sym,
+                            )
+                            new_id = 0
+                            try:
+                                new_id = int(resp2.get("result", {}).get("id", 0) or 0)
+                            except Exception:
+                                new_id = 0
+                            if new_id:
+                                pos.order_id = new_id
+                                pos.pending_since_tick = self.tick
+                                pos.pending_limit_price = float(new_limit)
+                                log.info(f"  Repriced limit submitted: {sym} order_id={new_id} limit={new_limit}")
+                            else:
+                                raise RuntimeError("No order id on repriced order")
+                        except Exception as e:
+                            log.warning(f"  Reprice failed for {sym}: {e}")
+                            if getattr(config, "LIMIT_FALLBACK_MARKET", True):
+                                resp_m = self.client.place_market_order(
+                                    pos.product_id,
+                                    "buy" if pos.side == "BUY" else "sell",
+                                    pos.size,
+                                    symbol=sym,
+                                )
+                                new_oid = 0
+                                fill_price = float(pos.entry_price or 0)
+                                try:
+                                    r = resp_m.get("result", {}) if isinstance(resp_m, dict) else {}
+                                    new_oid = int(r.get("id", 0) or 0)
+                                    fp = float(r.get("average_fill_price", 0) or 0)
+                                    if fp > 0:
+                                        fill_price = fp
+                                except Exception:
+                                    pass
+
+                                df_entry = self._fetch_candles(sym, config.TF_ENTRY, limit=200)
+                                atr_val = 0.0
+                                vol = None
+                                try:
+                                    if df_entry is not None and len(df_entry) > 20:
+                                        atr = compute_atr(df_entry, config.ATR_PERIOD)
+                                        import numpy as _np
+                                        atr_val = float(atr.iloc[-1]) if len(atr) > 0 and not _np.isnan(atr.iloc[-1]) else 0.0
+                                        reg = detect_regime(df_entry)
+                                        pos.regime = reg.get("regime", pos.regime)
+                                        vol = reg.get("atr_pct", None)
+                                except Exception:
+                                    atr_val = 0.0
+
+                                new_sl_tp = self.risk.calculate_sl_tp(float(fill_price), pos.side, float(atr_val), volatility=vol)
+                                pos.order_id = new_oid
+                                pos.order_type = "market_order"
+                                pos.mark_filled(float(fill_price), self.tick, new_sl_tp)
+                                alerts.alert_entry(
+                                    sym, pos.side, pos.entry_price, pos.size,
+                                    pos.sl_price, pos.tp_price,
+                                    getattr(pos, "confirmations", 0),
+                                    getattr(pos, "regime", ""),
+                                )
+                    else:
+                        if getattr(config, "LIMIT_FALLBACK_MARKET", True):
+                            resp_m = self.client.place_market_order(
+                                pos.product_id,
+                                "buy" if pos.side == "BUY" else "sell",
+                                pos.size,
+                                symbol=sym,
+                            )
+                            new_oid = 0
+                            fill_price = float(pos.entry_price or 0)
+                            try:
+                                r = resp_m.get("result", {}) if isinstance(resp_m, dict) else {}
+                                new_oid = int(r.get("id", 0) or 0)
+                                fp = float(r.get("average_fill_price", 0) or 0)
+                                if fp > 0:
+                                    fill_price = fp
+                            except Exception:
+                                pass
+
+                            df_entry = self._fetch_candles(sym, config.TF_ENTRY, limit=200)
+                            atr_val = 0.0
+                            vol = None
+                            try:
+                                if df_entry is not None and len(df_entry) > 20:
+                                    atr = compute_atr(df_entry, config.ATR_PERIOD)
+                                    import numpy as _np
+                                    atr_val = float(atr.iloc[-1]) if len(atr) > 0 and not _np.isnan(atr.iloc[-1]) else 0.0
+                                    reg = detect_regime(df_entry)
+                                    pos.regime = reg.get("regime", pos.regime)
+                                    vol = reg.get("atr_pct", None)
+                            except Exception:
+                                atr_val = 0.0
+
+                            new_sl_tp = self.risk.calculate_sl_tp(float(fill_price), pos.side, float(atr_val), volatility=vol)
+                            pos.order_id = new_oid
+                            pos.order_type = "market_order"
+                            pos.mark_filled(float(fill_price), self.tick, new_sl_tp)
+                            alerts.alert_entry(
+                                sym, pos.side, pos.entry_price, pos.size,
+                                pos.sl_price, pos.tp_price,
+                                getattr(pos, "confirmations", 0),
+                                getattr(pos, "regime", ""),
+                            )
 
         except Exception as e:
             log.warning(f"  Position sync failed: {e}")
@@ -840,7 +1393,7 @@ class TradingBot:
 
                 # ── 2. Signal flip detection on open positions ───
                 for sym, pos in list(self.positions.items()):
-                    if not pos.active:
+                    if not pos.active or not getattr(pos, "filled", False):
                         continue
                     df_e = self._fetch_candles(sym, config.TF_ENTRY)
                     df_t = self._fetch_candles(sym, config.TF_TREND)
@@ -852,10 +1405,16 @@ class TradingBot:
                     trend_bias = get_trend_bias(df_t) if df_t is not None else None
                     agg = aggregate_signals(signals, regime_weights,
                                             trend_bias, True)
+                    bars_held = self.tick - pos.entry_tick
+                    min_hold = getattr(config, 'MIN_HOLD_BARS', 4)
                     if agg["direction"] and agg["direction"] != pos.side:
-                        log.info(f"  {sym}: Signal flipped "
-                                 f"{pos.side} → {agg['direction']}")
-                        self._close_position(pos, "Signal Flip")
+                        if bars_held < min_hold:
+                            log.info(f"  {sym}: Signal flip suppressed — "
+                                     f"only {bars_held}/{min_hold} bars held")
+                        else:
+                            log.info(f"  {sym}: Signal flipped "
+                                     f"{pos.side} → {agg['direction']}")
+                            self._close_position(pos, "Signal Flip")
 
                 # ── 3. Scan for NEW entries if we have capacity ──
                 open_count = len([p for p in self.positions.values()

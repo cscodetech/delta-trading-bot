@@ -1,8 +1,11 @@
 """
-Railway entry point — runs both the trading bot and dashboard in one process.
+Railway entry point — runs the Flask dashboard (multi-user).
+
+Notes:
+- Start the trading bot per-user from the Dashboard UI (it runs as a subprocess with BOT_USER_ID).
+- Auto-close monitor is OFF by default and can be enabled per-user from the UI.
 """
 
-import threading
 import logging
 import os
 
@@ -13,30 +16,21 @@ logging.basicConfig(
 log = logging.getLogger("railway")
 
 
-def run_bot():
-    """Run the trading bot in a background thread."""
+def main():
+    from dashboard import app
     try:
-        from bot import TradingBot
-        bot = TradingBot()
-        bot.run()
-    except Exception as e:
-        log.error(f"Bot crashed: {e}", exc_info=True)
+        from waitress import serve
+    except Exception:
+        serve = None
 
-
-def run_dashboard():
-    """Run the Flask dashboard (blocking)."""
-    from dashboard import app, monitor
-    monitor.start()
-    port = int(os.getenv("PORT", 5050))
+    port = int(os.getenv("PORT", "5050"))
     log.info(f"Starting dashboard on port {port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+
+    if serve:
+        serve(app, host="0.0.0.0", port=port, threads=8)
+    else:
+        app.run(host="0.0.0.0", port=port, debug=False)
 
 
 if __name__ == "__main__":
-    # Start bot in background thread
-    bot_thread = threading.Thread(target=run_bot, daemon=True, name="TradingBot")
-    bot_thread.start()
-    log.info("Trading bot started in background thread")
-
-    # Run dashboard in main thread (Railway exposes this port)
-    run_dashboard()
+    main()

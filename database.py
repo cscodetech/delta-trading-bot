@@ -35,6 +35,17 @@ DB_CONFIG = {
 _local = threading.local()
 
 
+def current_user_id() -> int:
+    """
+    Returns the active bot/user context, if provided.
+    Used by bot.py/dashboard BotManager to tag records with a user_id.
+    """
+    try:
+        return int(os.getenv("BOT_USER_ID") or 0)
+    except Exception:
+        return 0
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CONNECTION MANAGEMENT
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -84,6 +95,7 @@ def init_db():
         cur.execute("""
             CREATE TABLE IF NOT EXISTS trades (
                 id          INT AUTO_INCREMENT PRIMARY KEY,
+                user_id     INT          NOT NULL DEFAULT 0,
                 symbol      VARCHAR(30)  NOT NULL,
                 side        VARCHAR(4)   NOT NULL,
                 entry_price DOUBLE       NOT NULL DEFAULT 0,
@@ -102,7 +114,8 @@ def init_db():
                 pnl_usd     DOUBLE       NOT NULL DEFAULT 0,
                 net_pnl_usd DOUBLE       NOT NULL DEFAULT 0,
                 INDEX idx_closed_at (closed_at),
-                INDEX idx_symbol (symbol)
+                INDEX idx_symbol (symbol),
+                INDEX idx_user_id (user_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
 
@@ -113,9 +126,20 @@ def init_db():
             cur.execute("ALTER TABLE trades ADD COLUMN pnl_usd DOUBLE NOT NULL DEFAULT 0")
             cur.execute("ALTER TABLE trades ADD COLUMN net_pnl_usd DOUBLE NOT NULL DEFAULT 0")
 
+        # Migration: add user_id if missing
+        try:
+            cur.execute("SELECT user_id FROM trades LIMIT 1")
+        except Exception:
+            cur.execute("ALTER TABLE trades ADD COLUMN user_id INT NOT NULL DEFAULT 0")
+            try:
+                cur.execute("CREATE INDEX idx_user_id ON trades (user_id)")
+            except Exception:
+                pass
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 id            INT AUTO_INCREMENT PRIMARY KEY,
+                user_id       INT          NOT NULL DEFAULT 0,
                 order_id      BIGINT       NOT NULL,
                 product_id    INT          NOT NULL,
                 symbol        VARCHAR(30)  NOT NULL,
@@ -130,9 +154,20 @@ def init_db():
                 updated_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
                               ON UPDATE CURRENT_TIMESTAMP,
                 INDEX idx_order_id (order_id),
-                INDEX idx_status (status)
+                INDEX idx_status (status),
+                INDEX idx_orders_user_id (user_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
+
+        # Migration: add user_id if missing
+        try:
+            cur.execute("SELECT user_id FROM orders LIMIT 1")
+        except Exception:
+            cur.execute("ALTER TABLE orders ADD COLUMN user_id INT NOT NULL DEFAULT 0")
+            try:
+                cur.execute("CREATE INDEX idx_orders_user_id ON orders (user_id)")
+            except Exception:
+                pass
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS settings (
@@ -156,16 +191,187 @@ def init_db():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
 
+        # Per-user strategy performance (multi-user)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_stats_user (
+                user_id     INT NOT NULL,
+                strategy    VARCHAR(30) NOT NULL,
+                trades      INT NOT NULL DEFAULT 0,
+                wins        INT NOT NULL DEFAULT 0,
+                losses      INT NOT NULL DEFAULT 0,
+                total_pnl   DOUBLE NOT NULL DEFAULT 0,
+                enabled     TINYINT NOT NULL DEFAULT 1,
+                updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                            ON UPDATE CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, strategy),
+                INDEX idx_strategy_user (user_id),
+                INDEX idx_strategy_name (strategy)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS filter_log (
                 id          INT AUTO_INCREMENT PRIMARY KEY,
+                user_id     INT          NOT NULL DEFAULT 0,
                 symbol      VARCHAR(30) NOT NULL,
                 filter_name VARCHAR(50) NOT NULL,
                 detail      VARCHAR(200) NOT NULL DEFAULT '',
                 created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                INDEX idx_created (created_at)
+                INDEX idx_created (created_at),
+                INDEX idx_filter_user_id (user_id)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """)
+
+        # Migration: add user_id if missing
+        try:
+            cur.execute("SELECT user_id FROM filter_log LIMIT 1")
+        except Exception:
+            cur.execute("ALTER TABLE filter_log ADD COLUMN user_id INT NOT NULL DEFAULT 0")
+            try:
+                cur.execute("CREATE INDEX idx_filter_user_id ON filter_log (user_id)")
+            except Exception:
+                pass
+
+        # Multi-user auth
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id            INT AUTO_INCREMENT PRIMARY KEY,
+                username      VARCHAR(50) NOT NULL UNIQUE,
+                password_hash VARCHAR(255) NOT NULL,
+                is_admin      TINYINT NOT NULL DEFAULT 0,
+                created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+
+        # Ensure there is always exactly one "first admin" user (helps migrations from older DBs).
+        try:
+            cur.execute("SELECT COUNT(*) AS cnt FROM users WHERE is_admin=1")
+            admin_cnt = int(cur.fetchone()["cnt"] or 0)
+            if admin_cnt <= 0:
+                cur.execute("SELECT id FROM users ORDER BY id ASC LIMIT 1")
+                first = cur.fetchone()
+                if first:
+                    cur.execute("UPDATE users SET is_admin=1 WHERE id=%s", (int(first["id"]),))
+        except Exception:
+            pass
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                id         INT AUTO_INCREMENT PRIMARY KEY,
+                user_id    INT NOT NULL,
+                `key`      VARCHAR(50) NOT NULL,
+                `value`    VARCHAR(500) NOT NULL DEFAULT '',
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                           ON UPDATE CURRENT_TIMESTAMP,
+                UNIQUE KEY uniq_user_key (user_id, `key`),
+                INDEX idx_user_settings_user (user_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+
+        # One-time migration: copy legacy strategy_stats -> strategy_stats_user (admin only)
+        try:
+            cur.execute("SELECT COUNT(*) AS cnt FROM strategy_stats_user")
+            has_user_stats = int(cur.fetchone()["cnt"] or 0) > 0
+            if not has_user_stats:
+                cur.execute("SELECT COUNT(*) AS cnt FROM strategy_stats")
+                legacy_cnt = int(cur.fetchone()["cnt"] or 0)
+                if legacy_cnt > 0:
+                    cur.execute("SELECT id FROM users WHERE is_admin=1 ORDER BY id ASC LIMIT 1")
+                    admin = cur.fetchone()
+                    admin_id = int(admin["id"]) if admin else 1
+                    cur.execute("""
+                        INSERT INTO strategy_stats_user
+                            (user_id, strategy, trades, wins, losses, total_pnl, enabled, updated_at)
+                        SELECT
+                            %s, strategy, trades, wins, losses, total_pnl, enabled, updated_at
+                        FROM strategy_stats
+                    """, (admin_id,))
+        except Exception:
+            pass
+
+        # Normalize ai_provider values (ollama removed; allow only claude/gemini/both)
+        try:
+            cur.execute(
+                "UPDATE user_settings SET `value`='claude' "
+                "WHERE `key`='ai_provider' AND `value` NOT IN ('claude','gemini','both')"
+            )
+        except Exception:
+            pass
+        try:
+            cur.execute(
+                "UPDATE settings SET `value`='claude' "
+                "WHERE `key`='ai_provider' AND `value` NOT IN ('claude','gemini','both')"
+            )
+        except Exception:
+            pass
+
+        # Cleanup: if non-admin users were auto-seeded with admin secrets, remove duplicates.
+        try:
+            cur.execute("SELECT id FROM users WHERE is_admin=1 ORDER BY id ASC LIMIT 1")
+            admin = cur.fetchone()
+            admin_id = int(admin["id"]) if admin else 0
+            if admin_id > 0:
+                # Assign legacy user_id=0 records to the admin, so other users never see them.
+                try:
+                    cur.execute("UPDATE trades SET user_id=%s WHERE user_id=0", (admin_id,))
+                except Exception:
+                    pass
+                try:
+                    cur.execute("UPDATE orders SET user_id=%s WHERE user_id=0", (admin_id,))
+                except Exception:
+                    pass
+                try:
+                    cur.execute("UPDATE filter_log SET user_id=%s WHERE user_id=0", (admin_id,))
+                except Exception:
+                    pass
+
+                sensitive = [
+                    "api_key", "api_secret",
+                    "telegram_token", "telegram_chat_id",
+                    "anthropic_api_key", "gemini_api_key",
+                ]
+                cur.execute(
+                    "SELECT `key`, `value` FROM user_settings WHERE user_id=%s AND `key` IN ("
+                    + ", ".join(["%s"] * len(sensitive))
+                    + ")",
+                    tuple([admin_id] + sensitive),
+                )
+                admin_map = {row["key"]: (row.get("value") or "") for row in cur.fetchall()}
+                try:
+                    cur.execute(
+                        "SELECT `key`, `value` FROM settings WHERE `key` IN ("
+                        + ", ".join(["%s"] * len(sensitive))
+                        + ")",
+                        tuple(sensitive),
+                    )
+                    global_map = {row["key"]: (row.get("value") or "") for row in cur.fetchall()}
+                except Exception:
+                    global_map = {}
+
+                for k in sensitive:
+                    v = (admin_map.get(k) or "").strip()
+                    if not v:
+                        v = ""
+                    gv = (global_map.get(k) or "").strip()
+
+                    # If non-admin users were seeded with the admin/global secrets, blank them out.
+                    # (keep rows so bots never fall back to global settings).
+                    if v:
+                        cur.execute(
+                            "UPDATE user_settings SET `value`='' "
+                            "WHERE user_id IN (SELECT id FROM users WHERE is_admin=0) "
+                            "AND `key`=%s AND TRIM(`value`)=%s",
+                            (k, v),
+                        )
+                    if gv and gv != v:
+                        cur.execute(
+                            "UPDATE user_settings SET `value`='' "
+                            "WHERE user_id IN (SELECT id FROM users WHERE is_admin=0) "
+                            "AND `key`=%s AND TRIM(`value`)=%s",
+                            (k, gv),
+                        )
+        except Exception:
+            pass
 
     log.info("  Database tables initialised")
 
@@ -179,16 +385,17 @@ def insert_trade(trade: dict) -> int:
     with get_cursor() as cur:
         cur.execute("""
             INSERT INTO trades
-                (symbol, side, entry_price, exit_price, pnl_pct, fee_pct,
+                (user_id, symbol, side, entry_price, exit_price, pnl_pct, fee_pct,
                  net_pnl_pct, size, reason, order_id, close_order_id,
                  regime, confirmations, closed_at, pnl_usd, net_pnl_usd)
             VALUES
-                (%(symbol)s, %(side)s, %(entry_price)s, %(exit_price)s,
+                (%(user_id)s, %(symbol)s, %(side)s, %(entry_price)s, %(exit_price)s,
                  %(pnl_pct)s, %(fee_pct)s, %(net_pnl_pct)s, %(size)s,
                  %(reason)s, %(order_id)s, %(close_order_id)s,
                  %(regime)s, %(confirmations)s, %(closed_at)s,
                  %(pnl_usd)s, %(net_pnl_usd)s)
         """, {
+            "user_id": int(trade.get("user_id", current_user_id()) or 0),
             "symbol": trade.get("symbol", ""),
             "side": trade.get("side", ""),
             "entry_price": trade.get("entry_price", 0),
@@ -209,12 +416,13 @@ def insert_trade(trade: dict) -> int:
         return cur.lastrowid
 
 
-def get_trades(limit: int = 100) -> list[dict]:
+def get_trades(limit: int = 100, user_id: int | None = None) -> list[dict]:
     """Get recent trades, newest first."""
+    uid = current_user_id() if user_id is None else int(user_id or 0)
     with get_cursor() as cur:
         cur.execute(
-            "SELECT * FROM trades ORDER BY closed_at DESC LIMIT %s",
-            (limit,)
+            "SELECT * FROM trades WHERE user_id=%s ORDER BY closed_at DESC LIMIT %s",
+            (uid, limit),
         )
         rows = cur.fetchall()
         # Convert datetime objects to ISO strings for JSON
@@ -225,32 +433,36 @@ def get_trades(limit: int = 100) -> list[dict]:
         return rows
 
 
-def get_today_trade_count() -> int:
+def get_today_trade_count(user_id: int | None = None) -> int:
     """Count trades closed today."""
+    uid = current_user_id() if user_id is None else int(user_id or 0)
     with get_cursor() as cur:
         cur.execute(
-            "SELECT COUNT(*) AS cnt FROM trades WHERE DATE(closed_at) = CURDATE()"
+            "SELECT COUNT(*) AS cnt FROM trades WHERE user_id=%s AND DATE(closed_at) = CURDATE()",
+            (uid,),
         )
         return cur.fetchone()["cnt"]
 
 
-def get_trade_stats() -> dict:
+def get_trade_stats(user_id: int | None = None) -> dict:
     """Aggregate trade statistics."""
+    uid = current_user_id() if user_id is None else int(user_id or 0)
     with get_cursor() as cur:
         cur.execute("""
             SELECT
                 COUNT(*)                                          AS total_trades,
-                SUM(CASE WHEN net_pnl_pct > 0 THEN 1 ELSE 0 END) AS wins,
-                SUM(CASE WHEN net_pnl_pct <= 0 THEN 1 ELSE 0 END) AS losses,
+                SUM(CASE WHEN net_pnl_usd > 0 THEN 1 ELSE 0 END)  AS wins,
+                SUM(CASE WHEN net_pnl_usd <= 0 THEN 1 ELSE 0 END) AS losses,
                 ROUND(SUM(net_pnl_pct), 3)                        AS total_pnl,
-                ROUND(SUM(CASE WHEN net_pnl_pct > 0
-                          THEN net_pnl_pct ELSE 0 END), 3)        AS gross_profit,
-                ROUND(ABS(SUM(CASE WHEN net_pnl_pct < 0
-                          THEN net_pnl_pct ELSE 0 END)), 3)       AS gross_loss,
+                ROUND(SUM(CASE WHEN net_pnl_usd > 0
+                          THEN net_pnl_usd ELSE 0 END), 4)       AS gross_profit,
+                ROUND(ABS(SUM(CASE WHEN net_pnl_usd < 0
+                          THEN net_pnl_usd ELSE 0 END)), 4)      AS gross_loss,
                 ROUND(SUM(fee_pct), 4)                             AS total_fees,
                 ROUND(SUM(net_pnl_usd), 4)                         AS total_pnl_usd
             FROM trades
-        """)
+            WHERE user_id=%s
+        """, (uid,))
         row = cur.fetchone()
         total = int(row["total_trades"] or 0)
         wins = int(row["wins"] or 0)
@@ -276,60 +488,78 @@ def get_trade_stats() -> dict:
 
 def update_strategy_stat(strategy: str, won: bool, pnl: float):
     """Increment a strategy's win/loss counter."""
+    uid = current_user_id()
     with get_cursor() as cur:
         cur.execute("""
-            INSERT INTO strategy_stats (strategy, trades, wins, losses, total_pnl)
-            VALUES (%s, 1, %s, %s, %s)
+            INSERT INTO strategy_stats_user (user_id, strategy, trades, wins, losses, total_pnl)
+            VALUES (%s, %s, 1, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 trades = trades + 1,
                 wins = wins + VALUES(wins),
                 losses = losses + VALUES(losses),
                 total_pnl = total_pnl + VALUES(total_pnl)
-        """, (strategy, 1 if won else 0, 0 if won else 1, pnl))
+        """, (uid, strategy, 1 if won else 0, 0 if won else 1, pnl))
 
 
-def get_strategy_stats() -> list[dict]:
+def get_strategy_stats(user_id: int | None = None) -> list[dict]:
     """Get performance stats for all strategies."""
+    uid = current_user_id() if user_id is None else int(user_id or 0)
     with get_cursor() as cur:
-        cur.execute("SELECT * FROM strategy_stats ORDER BY strategy")
+        cur.execute(
+            "SELECT strategy, trades, wins, losses, total_pnl, enabled, updated_at "
+            "FROM strategy_stats_user WHERE user_id=%s ORDER BY strategy",
+            (uid,),
+        )
         return [dict(row) for row in cur.fetchall()]
 
 
-def get_disabled_strategies() -> set[str]:
+def get_disabled_strategies(user_id: int | None = None) -> set[str]:
     """Return set of auto-disabled strategy names."""
+    uid = current_user_id() if user_id is None else int(user_id or 0)
     with get_cursor() as cur:
-        cur.execute("SELECT strategy FROM strategy_stats WHERE enabled = 0")
+        cur.execute(
+            "SELECT strategy FROM strategy_stats_user WHERE user_id=%s AND enabled = 0",
+            (uid,),
+        )
         return {row["strategy"] for row in cur.fetchall()}
 
 
-def set_strategy_enabled(strategy: str, enabled: bool):
+def set_strategy_enabled(strategy: str, enabled: bool, user_id: int | None = None):
     """Enable or disable a strategy."""
+    uid = current_user_id() if user_id is None else int(user_id or 0)
     with get_cursor() as cur:
         cur.execute("""
-            UPDATE strategy_stats SET enabled = %s WHERE strategy = %s
-        """, (1 if enabled else 0, strategy))
+            INSERT INTO strategy_stats_user (user_id, strategy, enabled)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE enabled = VALUES(enabled)
+        """, (uid, strategy, 1 if enabled else 0))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  FILTER LOG — track why trades are blocked
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def log_filter_block(symbol: str, filter_name: str, detail: str):
+def log_filter_block(symbol: str, filter_name: str, detail: str, user_id: int | None = None):
     """Record a filter block event for dashboard display."""
+    uid = current_user_id() if user_id is None else int(user_id or 0)
     with get_cursor() as cur:
         cur.execute("""
-            INSERT INTO filter_log (symbol, filter_name, detail)
-            VALUES (%s, %s, %s)
-        """, (symbol, filter_name, detail[:200]))
+            INSERT INTO filter_log (user_id, symbol, filter_name, detail)
+            VALUES (%s, %s, %s, %s)
+        """, (uid, symbol, filter_name, detail[:200]))
 
 
-def get_recent_filter_blocks(limit: int = 50) -> list[dict]:
+def get_recent_filter_blocks(limit: int = 50, user_id: int | None = None) -> list[dict]:
     """Get recent filter blocks for dashboard."""
+    uid = current_user_id() if user_id is None else int(user_id or 0)
     with get_cursor() as cur:
         cur.execute("""
             SELECT symbol, filter_name, detail, created_at
-            FROM filter_log ORDER BY created_at DESC LIMIT %s
-        """, (limit,))
+            FROM filter_log
+            WHERE user_id=%s
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (uid, limit))
         return [dict(row) for row in cur.fetchall()]
 
 
@@ -342,13 +572,14 @@ def insert_order(order: dict) -> int:
     with get_cursor() as cur:
         cur.execute("""
             INSERT INTO orders
-                (order_id, product_id, symbol, side, order_type,
+                (user_id, order_id, product_id, symbol, side, order_type,
                  size, price, status, response_json)
             VALUES
-                (%(order_id)s, %(product_id)s, %(symbol)s, %(side)s,
+                (%(user_id)s, %(order_id)s, %(product_id)s, %(symbol)s, %(side)s,
                  %(order_type)s, %(size)s, %(price)s, %(status)s,
                  %(response_json)s)
         """, {
+            "user_id": int(order.get("user_id", current_user_id()) or 0),
             "order_id": order.get("order_id", 0),
             "product_id": order.get("product_id", 0),
             "symbol": order.get("symbol", ""),
@@ -378,12 +609,15 @@ def update_order_status(order_id: int, status: str,
             )
 
 
-def get_pending_orders() -> list[dict]:
+def get_pending_orders(user_id: int | None = None) -> list[dict]:
     """Get all orders that haven't been confirmed as filled/cancelled."""
+    uid = current_user_id() if user_id is None else int(user_id or 0)
     with get_cursor() as cur:
         cur.execute(
-            "SELECT * FROM orders WHERE status IN ('pending','open') "
-            "ORDER BY created_at DESC"
+            "SELECT * FROM orders "
+            "WHERE user_id=%s AND status IN ('pending','open','partially_filled','unknown') "
+            "ORDER BY created_at DESC",
+            (uid,),
         )
         return cur.fetchall()
 
@@ -399,7 +633,31 @@ def get_order_by_id(order_id: int) -> dict | None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def get_setting(key: str, default: str = "") -> str:
+    """
+    Read a setting.
+
+    If BOT_USER_ID is set (>0), user_settings takes priority (including empty values).
+    For sensitive keys, we never fall back to global settings to avoid leaking admin
+    credentials into other users' bot processes.
+    """
+    uid = current_user_id()
+    sensitive = {
+        "api_key", "api_secret",
+        "telegram_token", "telegram_chat_id",
+        "anthropic_api_key", "gemini_api_key",
+    }
     with get_cursor() as cur:
+        if uid > 0:
+            cur.execute(
+                "SELECT `value` FROM user_settings WHERE user_id=%s AND `key`=%s",
+                (uid, key),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                return row.get("value", default)
+            if key in sensitive:
+                return default
+
         cur.execute("SELECT `value` FROM settings WHERE `key`=%s", (key,))
         row = cur.fetchone()
         return row["value"] if row else default
@@ -411,6 +669,110 @@ def set_setting(key: str, value: str):
             INSERT INTO settings (`key`, `value`) VALUES (%s, %s)
             ON DUPLICATE KEY UPDATE `value`=%s
         """, (key, value, value))
+
+
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+#  MULTI-USER: USERS + PER-USER SETTINGS
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+def count_users() -> int:
+    with get_cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS cnt FROM users")
+        return int(cur.fetchone()["cnt"])
+
+
+def create_user(username: str, password_hash: str, is_admin: bool = False) -> int:
+    with get_cursor() as cur:
+        cur.execute(
+            "INSERT INTO users (username, password_hash, is_admin) VALUES (%s, %s, %s)",
+            (username, password_hash, 1 if is_admin else 0),
+        )
+        return int(cur.lastrowid)
+
+
+def get_user_by_username(username: str) -> dict | None:
+    with get_cursor() as cur:
+        cur.execute("SELECT * FROM users WHERE username=%s", (username,))
+        return cur.fetchone()
+
+
+def get_user_by_id(user_id: int) -> dict | None:
+    with get_cursor() as cur:
+        cur.execute("SELECT * FROM users WHERE id=%s", (int(user_id),))
+        return cur.fetchone()
+
+
+def update_user_password(user_id: int, password_hash: str):
+    with get_cursor() as cur:
+        cur.execute(
+            "UPDATE users SET password_hash=%s WHERE id=%s",
+            (password_hash, int(user_id)),
+        )
+
+
+def get_user_setting(user_id: int, key: str, default: str = "") -> str:
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT `value` FROM user_settings WHERE user_id=%s AND `key`=%s",
+            (int(user_id), key),
+        )
+        row = cur.fetchone()
+        return row["value"] if row else default
+
+
+def set_user_setting(user_id: int, key: str, value: str):
+    with get_cursor() as cur:
+        cur.execute(
+            "INSERT INTO user_settings (user_id, `key`, `value`) VALUES (%s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE `value`=%s",
+            (int(user_id), key, value, value),
+        )
+
+
+def get_user_settings(user_id: int) -> dict[str, str]:
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT `key`, `value` FROM user_settings WHERE user_id=%s",
+            (int(user_id),),
+        )
+        out: dict[str, str] = {}
+        for row in cur.fetchall():
+            out[str(row["key"])] = str(row.get("value") or "")
+        return out
+
+
+def seed_user_settings_from_global(user_id: int, keys: list[str] | None = None):
+    """
+    Copy global settings into user_settings if the user doesn't already have the key.
+    Useful when migrating from single-user to multi-user.
+    """
+    keys = keys or [
+        "api_key", "api_secret", "testnet",
+        "telegram_token", "telegram_chat_id",
+        "anthropic_api_key", "gemini_api_key",
+        "ai_provider", "ai_enabled",
+    ]
+    with get_cursor() as cur:
+        cur.execute(
+            "SELECT `key`, `value` FROM settings WHERE `key` IN ("
+            + ", ".join(["%s"] * len(keys))
+            + ")",
+            tuple(keys),
+        )
+        global_map = {row["key"]: row["value"] for row in cur.fetchall()}
+
+    allowed_ai = {"claude", "gemini", "both"}
+
+    for k in keys:
+        existing = get_user_setting(int(user_id), k, default="__MISSING__")
+        if existing != "__MISSING__":
+            continue
+        val = str(global_map.get(k) or "")
+        if k == "ai_provider":
+            v = val.strip().lower()
+            val = v if v in allowed_ai else "claude"
+        if val != "":
+            set_user_setting(int(user_id), k, val)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -450,7 +812,7 @@ def migrate_json_trades(json_path: str):
 #  SYNC PAST TRADES FROM EXCHANGE FILLS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def sync_past_trades(exchange_client) -> int:
+def sync_past_trades(exchange_client, user_id: int | None = None) -> int:
     """
     Fetch fills from the exchange API, reconstruct round-trip trades,
     and insert any missing ones into the DB.  Deduplicates by close_order_id.
@@ -469,12 +831,15 @@ def sync_past_trades(exchange_client) -> int:
         sym = f["product_symbol"]
         by_symbol.setdefault(sym, []).append(f)
 
-    # Existing close_order_ids for dedup
+    uid = current_user_id() if user_id is None else int(user_id or 0)
+
+    # Existing close_order_ids for dedup (scoped per user)
     existing_close_ids: set[int] = set()
     with get_cursor() as cur:
         cur.execute(
             "SELECT close_order_id FROM trades "
-            "WHERE close_order_id IS NOT NULL"
+            "WHERE close_order_id IS NOT NULL AND user_id=%s",
+            (uid,),
         )
         for row in cur.fetchall():
             existing_close_ids.add(int(row["close_order_id"]))
@@ -549,6 +914,7 @@ def sync_past_trades(exchange_client) -> int:
                     net_pnl_usd = round(notional_usd * (pnl_pct - fee_pct) / 100, 4)
 
                     insert_trade({
+                        "user_id": uid,
                         "symbol": sym,
                         "side": trade_side,
                         "entry_price": round(avg_entry, 6),

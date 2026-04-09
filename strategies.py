@@ -510,7 +510,7 @@ def aggregate_signals(signals: list[Signal],
         else:
             details.append(f"  {sig.name:20s} → HOLD  {sig.detail}")
 
-    # Determine direction
+    # Determine direction (raw)
     if buy_score > sell_score and buy_count >= 1:
         direction = "BUY"
         confirmations = buy_count
@@ -520,14 +520,69 @@ def aggregate_signals(signals: list[Signal],
         confirmations = sell_count
         total_score = sell_score
     else:
-        return {"direction": None, "confirmations": 0,
-                "total_score": 0.0, "details": details}
+        return {
+            "direction": None,
+            "confirmations": 0,
+            "total_score": 0.0,
+            "buy_score": buy_score,
+            "sell_score": sell_score,
+            "dominance": 0.0,
+            "confidence": 0.0,
+            "details": details,
+        }
+
+    # Conflict / edge checks (reduce noisy flips)
+    eps = 1e-9
+    raw_total = buy_score + sell_score
+    score_diff = abs(buy_score - sell_score)
+    dominance = score_diff / (raw_total + eps) if raw_total > 0 else 0.0
+    edge_ratio = (total_score / (min(buy_score, sell_score) + eps)) if min(buy_score, sell_score) > 0 else 999.0
+
+    min_dom = getattr(config, "MIN_SCORE_DOMINANCE", 0.28)
+    min_edge_ratio = getattr(config, "MIN_SCORE_EDGE_RATIO", 1.25)  # winner must be >= 1.25× loser
+    min_diff = getattr(config, "MIN_SCORE_DIFF", 0.75)
+
+    if (buy_count > 0 and sell_count > 0) and dominance < min_dom:
+        details.append(f"  BLOCKED: conflicting signals (dominance {dominance:.2f} < {min_dom})")
+        return {
+            "direction": None,
+            "confirmations": confirmations,
+            "total_score": total_score,
+            "buy_score": buy_score,
+            "sell_score": sell_score,
+            "dominance": dominance,
+            "confidence": 0.0,
+            "details": details,
+        }
+
+    if (buy_count > 0 and sell_count > 0) and (edge_ratio < min_edge_ratio) and (score_diff < min_diff):
+        details.append(
+            f"  BLOCKED: weak edge (diff {score_diff:.2f} < {min_diff} and edge {edge_ratio:.2f} < {min_edge_ratio})"
+        )
+        return {
+            "direction": None,
+            "confirmations": confirmations,
+            "total_score": total_score,
+            "buy_score": buy_score,
+            "sell_score": sell_score,
+            "dominance": dominance,
+            "confidence": 0.0,
+            "details": details,
+        }
 
     # Filter 1: minimum confirmations
     if confirmations < config.MIN_CONFIRMATIONS:
         details.append(f"  BLOCKED: {confirmations} confirmations < {config.MIN_CONFIRMATIONS} required")
-        return {"direction": None, "confirmations": confirmations,
-                "total_score": total_score, "details": details}
+        return {
+            "direction": None,
+            "confirmations": confirmations,
+            "total_score": total_score,
+            "buy_score": buy_score,
+            "sell_score": sell_score,
+            "dominance": dominance,
+            "confidence": 0.0,
+            "details": details,
+        }
 
     # Filter 2: trend alignment — penalise but don't hard-block
     if trend_bias is not None and direction != trend_bias:
@@ -543,13 +598,35 @@ def aggregate_signals(signals: list[Signal],
     min_score = config.MIN_SIGNAL_SCORE if hasattr(config, 'MIN_SIGNAL_SCORE') else 2.0
     if total_score < min_score:
         details.append(f"  BLOCKED: score {total_score:.2f} < {min_score} after penalties")
-        return {"direction": None, "confirmations": confirmations,
-                "total_score": total_score, "details": details}
+        return {
+            "direction": None,
+            "confirmations": confirmations,
+            "total_score": total_score,
+            "buy_score": buy_score,
+            "sell_score": sell_score,
+            "dominance": dominance,
+            "confidence": 0.0,
+            "details": details,
+        }
 
-    details.append(f"  SIGNAL: {direction} (confirms={confirmations}, score={total_score:.2f})")
+    # Rule-based confidence (0..1), used for SL/TP sizing without paid AI
+    score_factor = min(1.0, total_score / (min_score * 1.6)) if min_score > 0 else 0.0
+    conf_factor = min(1.0, confirmations / max(config.MIN_CONFIRMATIONS, 1))
+    confidence = (0.45 * score_factor) + (0.35 * dominance) + (0.20 * conf_factor)
+    if trend_bias is not None and direction != trend_bias:
+        confidence *= 0.85
+    if not confirm_ok:
+        confidence *= 0.85
+    confidence = max(0.0, min(0.95, confidence))
+
+    details.append(f"  SIGNAL: {direction} (confirms={confirmations}, score={total_score:.2f}, conf={confidence:.2f})")
     return {
         "direction": direction,
         "confirmations": confirmations,
         "total_score": total_score,
+        "buy_score": buy_score,
+        "sell_score": sell_score,
+        "dominance": dominance,
+        "confidence": confidence,
         "details": details,
     }

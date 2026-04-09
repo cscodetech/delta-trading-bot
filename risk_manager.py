@@ -34,6 +34,9 @@ class TradeRecord:
     pnl_pct: float = 0.0
     fee_pct: float = 0.0
     net_pnl_pct: float = 0.0
+    pnl_usd: float = 0.0
+    net_pnl_usd: float = 0.0
+    contract_value: float = 1.0
     size: int = 0
     timestamp: float = 0.0
     reason: str = ""
@@ -53,7 +56,7 @@ class RiskManager:
 
         # Daily tracking
         self._today: date = date.today()
-        self._daily_pnl: float = 0.0
+        self._daily_start_balance: float = 0.0
         self._daily_trades: int = 0
 
         # Streak tracking
@@ -74,6 +77,7 @@ class RiskManager:
         self.starting_balance = balance
         self.current_balance = balance
         self.peak_balance = balance
+        self._daily_start_balance = balance
         log.info(f"  RiskManager initialised: balance=${balance:,.2f}")
 
     # ── Daily reset ──────────────────────────────────────────
@@ -81,10 +85,18 @@ class RiskManager:
     def _check_day_rollover(self):
         today = date.today()
         if today != self._today:
-            log.info(f"  New day: resetting daily counters. "
-                     f"Yesterday PnL: {self._daily_pnl:+.4f}")
+            try:
+                y_pnl_usd = self.current_balance - self._daily_start_balance
+                y_pnl_pct = (y_pnl_usd / self._daily_start_balance * 100) if self._daily_start_balance > 0 else 0.0
+            except Exception:
+                y_pnl_usd = 0.0
+                y_pnl_pct = 0.0
+            log.info(
+                "  New day: resetting daily counters. "
+                f"Yesterday PnL: {y_pnl_usd:+.2f} USD ({y_pnl_pct:+.2f}%)"
+            )
             self._today = today
-            self._daily_pnl = 0.0
+            self._daily_start_balance = self.current_balance
             self._daily_trades = 0
 
     # ── Can we trade? ────────────────────────────────────────
@@ -97,9 +109,10 @@ class RiskManager:
             return False, f"KILLED: {self.kill_reason}"
 
         # Daily loss limit
-        if self.starting_balance > 0:
-            daily_loss_pct = abs(min(0, self._daily_pnl)) / self.starting_balance * 100
-            if daily_loss_pct >= config.DAILY_LOSS_LIMIT_PCT:
+        if self._daily_start_balance > 0:
+            daily_pnl_usd = self.current_balance - self._daily_start_balance
+            daily_loss_pct = max(0.0, (-daily_pnl_usd) / self._daily_start_balance * 100)
+            if daily_loss_pct >= float(config.DAILY_LOSS_LIMIT_PCT):
                 self.killed = True
                 self.kill_reason = (
                     f"Daily loss limit hit: {daily_loss_pct:.2f}% "
@@ -175,19 +188,41 @@ class RiskManager:
 
     # ── SL/TP calculation ────────────────────────────────────
 
-    def calculate_sl_tp(self, price: float, side: str, atr: float) -> dict:
-        """Returns dict with sl_price, tp_price, trail_distance."""
+    def calculate_sl_tp(self, price: float, side: str, atr: float, ai_confidence: float = None, volatility: float = None) -> dict:
+        """
+        Returns dict with sl_price, tp_price, trail_distance.
+        Adaptive: tightens SL/TP in high volatility, widens in low volatility, and scales with AI confidence.
+        """
+        sl_mult = config.SL_ATR_MULT
+        tp_mult = config.TP_ATR_MULT
+        trail_mult = config.TRAIL_ATR_MULT
+        # Adapt SL/TP based on AI confidence
+        if ai_confidence is not None:
+            if ai_confidence >= 0.8:
+                sl_mult *= 0.9
+                tp_mult *= 1.2
+            elif ai_confidence < 0.65:
+                sl_mult *= 0.7
+                tp_mult *= 0.9
+        # Adapt SL/TP based on volatility (ATR as % of price)
+        if volatility is not None:
+            if volatility > 2.0:  # High volatility, tighten SL
+                sl_mult *= 0.8
+                tp_mult *= 0.9
+            elif volatility < 0.5:  # Low volatility, widen SL/TP
+                sl_mult *= 1.2
+                tp_mult *= 1.2
         if config.SL_MODE == "atr" and atr > 0:
-            sl_dist = atr * config.SL_ATR_MULT
+            sl_dist = atr * sl_mult
         else:
             sl_dist = price * (config.SL_FIXED_PCT / 100)
 
         if config.TP_MODE == "atr" and atr > 0:
-            tp_dist = atr * config.TP_ATR_MULT
+            tp_dist = atr * tp_mult
         else:
             tp_dist = price * (config.TP_FIXED_PCT / 100)
 
-        trail_dist = atr * config.TRAIL_ATR_MULT if atr > 0 else sl_dist
+        trail_dist = atr * trail_mult if atr > 0 else sl_dist
 
         if side == "BUY":
             sl_price = price - sl_dist
@@ -225,17 +260,24 @@ class RiskManager:
                 record.entry_price, record.exit_price, record.size)
         record.net_pnl_pct = round(record.pnl_pct - record.fee_pct, 4)
 
+        # Compute USD PnL from notional if caller didn't provide it
+        cv = float(getattr(record, "contract_value", 1.0) or 1.0)
+        notional_usd = float(record.size or 0) * cv * float(record.entry_price or 0)
+        if notional_usd > 0:
+            if not getattr(record, "pnl_usd", 0.0):
+                record.pnl_usd = round(notional_usd * (record.pnl_pct / 100.0), 4)
+            if not getattr(record, "net_pnl_usd", 0.0):
+                record.net_pnl_usd = round(notional_usd * (record.net_pnl_pct / 100.0), 4)
+
         self.trade_history.append(record)
         self._daily_trades += 1
-        self._daily_pnl += record.net_pnl_pct
 
-        # Update balance using net PnL (after fees)
-        pnl_amount = self.current_balance * (record.net_pnl_pct / 100)
-        self.current_balance += pnl_amount
+        # Update wallet balance in USD terms (trade PnL is on notional, not on full wallet)
+        self.current_balance += float(record.net_pnl_usd or 0.0)
         self.peak_balance = max(self.peak_balance, self.current_balance)
 
         # Streak tracking
-        if record.net_pnl_pct < 0:
+        if float(getattr(record, "net_pnl_usd", 0.0) or 0.0) < 0:
             self._consecutive_losses += 1
             self._consecutive_wins = 0
             self._cooldown_ticks = config.COOLDOWN_AFTER_LOSS
@@ -245,11 +287,19 @@ class RiskManager:
             self._consecutive_wins += 1
             self._consecutive_losses = 0
 
+        try:
+            daily_pnl_usd = self.current_balance - self._daily_start_balance
+            daily_pnl_pct = (daily_pnl_usd / self._daily_start_balance * 100) if self._daily_start_balance > 0 else 0.0
+        except Exception:
+            daily_pnl_usd = 0.0
+            daily_pnl_pct = 0.0
+
         log.info(
             f"  Trade recorded: {record.side} {record.symbol} "
             f"PnL={record.pnl_pct:+.2f}% fees={record.fee_pct:.2f}% "
             f"net={record.net_pnl_pct:+.2f}% | "
-            f"Daily={self._daily_pnl:+.2f}% | "
+            f"net_usd={record.net_pnl_usd:+.2f} | "
+            f"Daily={daily_pnl_usd:+.2f} USD ({daily_pnl_pct:+.2f}%) | "
             f"Trades today={self._daily_trades}/{config.MAX_TRADES_PER_DAY} | "
             f"Streak: W{self._consecutive_wins}/L{self._consecutive_losses}"
         )
@@ -268,6 +318,8 @@ class RiskManager:
                 "pnl_pct": round(record.pnl_pct, 4),
                 "fee_pct": record.fee_pct,
                 "net_pnl_pct": record.net_pnl_pct,
+                "pnl_usd": float(getattr(record, "pnl_usd", 0.0) or 0.0),
+                "net_pnl_usd": float(getattr(record, "net_pnl_usd", 0.0) or 0.0),
                 "size": record.size,
                 "reason": record.reason,
                 "order_id": record.order_id or None,
@@ -286,23 +338,30 @@ class RiskManager:
         if total == 0:
             return {"total_trades": 0}
 
-        wins = [t for t in self.trade_history if t.pnl_pct > 0]
-        losses = [t for t in self.trade_history if t.pnl_pct <= 0]
+        wins = [t for t in self.trade_history if float(getattr(t, "net_pnl_usd", 0.0) or 0.0) > 0]
+        losses = [t for t in self.trade_history if float(getattr(t, "net_pnl_usd", 0.0) or 0.0) <= 0]
 
-        total_profit = sum(t.pnl_pct for t in wins)
-        total_loss = abs(sum(t.pnl_pct for t in losses))
+        gross_profit = sum(float(getattr(t, "net_pnl_usd", 0.0) or 0.0) for t in wins)
+        gross_loss = abs(sum(float(getattr(t, "net_pnl_usd", 0.0) or 0.0) for t in losses))
+
+        total_pnl_usd = self.current_balance - self.starting_balance
+        total_pnl_pct = (total_pnl_usd / self.starting_balance * 100) if self.starting_balance > 0 else 0.0
+        daily_pnl_usd = self.current_balance - self._daily_start_balance
+        daily_pnl_pct = (daily_pnl_usd / self._daily_start_balance * 100) if self._daily_start_balance > 0 else 0.0
 
         return {
             "total_trades": total,
             "wins": len(wins),
             "losses": len(losses),
             "win_rate": round(len(wins) / total * 100, 1),
-            "total_pnl_pct": round(sum(t.pnl_pct for t in self.trade_history), 2),
-            "profit_factor": round(total_profit / total_loss, 2) if total_loss > 0 else 999,
-            "avg_win": round(total_profit / len(wins), 2) if wins else 0,
-            "avg_loss": round(-total_loss / len(losses), 2) if losses else 0,
+            "total_pnl_pct": round(total_pnl_pct, 2),
+            "total_pnl_usd": round(total_pnl_usd, 2),
+            "profit_factor": round(gross_profit / gross_loss, 2) if gross_loss > 0 else 999,
+            "avg_win": round(gross_profit / len(wins), 2) if wins else 0,
+            "avg_loss": round(-gross_loss / len(losses), 2) if losses else 0,
             "max_consecutive_losses": self._max_streak(False),
-            "daily_pnl": round(self._daily_pnl, 3),
+            "daily_pnl": round(daily_pnl_pct, 3),
+            "daily_pnl_usd": round(daily_pnl_usd, 2),
             "daily_trades": self._daily_trades,
             "drawdown_pct": round(
                 (self.peak_balance - self.current_balance) / self.peak_balance * 100, 2
@@ -312,7 +371,8 @@ class RiskManager:
     def _max_streak(self, wins: bool) -> int:
         max_s = cur = 0
         for t in self.trade_history:
-            if (t.pnl_pct > 0) == wins:
+            is_win = float(getattr(t, "net_pnl_usd", 0.0) or 0.0) > 0
+            if is_win == wins:
                 cur += 1
                 max_s = max(max_s, cur)
             else:

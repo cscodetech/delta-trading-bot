@@ -36,6 +36,58 @@ logging.basicConfig(level=logging.WARNING, format="%(message)s")
 log = logging.getLogger("backtest")
 
 
+def _tf_to_minutes(tf: str) -> int:
+    tf = str(tf or "").strip().lower()
+    if not tf:
+        return 60
+    try:
+        if tf.endswith("m"):
+            return int(tf[:-1])
+        if tf.endswith("h"):
+            return int(tf[:-1]) * 60
+        if tf.endswith("d"):
+            return int(tf[:-1]) * 1440
+        if tf.endswith("w"):
+            return int(tf[:-1]) * 10080
+    except Exception:
+        return 60
+    return 60
+
+
+def _with_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Return df with UTC datetime index derived from df['time'] (s or ms)."""
+    if df is None or df.empty or "time" not in df.columns:
+        return df
+    t = df["time"]
+    # Heuristic: milliseconds are much larger
+    unit = "ms"
+    try:
+        last = int(float(t.iloc[-1]))
+        unit = "ms" if last > 1_000_000_000_000 else "s"
+    except Exception:
+        unit = "s"
+    out = df.copy()
+    out["_dt"] = pd.to_datetime(out["time"], unit=unit, utc=True, errors="coerce")
+    out = out.dropna(subset=["_dt"])
+    out = out.set_index("_dt")
+    return out
+
+
+def _resample_ohlcv(df_dt: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    if df_dt is None or df_dt.empty:
+        return pd.DataFrame()
+    rule = f"{int(minutes)}min"
+    ohlc = df_dt.resample(rule).agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum",
+        "time": "last",
+    })
+    return ohlc.dropna(subset=["open", "high", "low", "close"])
+
+
 @dataclass
 class BacktestTrade:
     bar_entry: int
@@ -173,6 +225,29 @@ def run_backtest(symbol: str = "BTCUSD",
     client = DeltaClient(config.API_KEY, config.API_SECRET, testnet=config.TESTNET)
     df = client.get_candles(symbol, timeframe, limit=candle_count)
 
+    # Build multi-timeframe views from entry candles (resample in UTC)
+    df_dt = _with_datetime_index(df)
+    entry_min = _tf_to_minutes(timeframe)
+    confirm_min = _tf_to_minutes(getattr(config, "TF_CONFIRM", "1h"))
+    trend_min = _tf_to_minutes(getattr(config, "TF_TREND", "4h"))
+
+    df_confirm_all = _resample_ohlcv(df_dt, confirm_min) if confirm_min > entry_min else df_dt.copy()
+    df_trend_all = _resample_ohlcv(df_dt, trend_min) if trend_min > entry_min else df_dt.copy()
+
+    # Map each entry bar to a datetime for alignment
+    dt_series = []
+    try:
+        if df_dt is not None and len(df_dt) == len(df):
+            dt_series = list(df_dt.index)
+        else:
+            t = df["time"]
+            unit = "ms"
+            last = int(float(t.iloc[-1]))
+            unit = "ms" if last > 1_000_000_000_000 else "s"
+            dt_series = list(pd.to_datetime(t, unit=unit, utc=True, errors="coerce"))
+    except Exception:
+        dt_series = [pd.Timestamp.utcnow()] * len(df)
+
     if len(df) < 100:
         if not quiet:
             print(f"  ERROR: Only {len(df)} candles fetched (need 100+)")
@@ -277,15 +352,28 @@ def run_backtest(symbol: str = "BTCUSD",
                 equity_curve.append(balance)
                 continue
 
-            # Run strategy pipeline
+            # Run strategy pipeline (align confirm/trend TF via resample)
             regime_info = detect_regime(window)
             regime_weights = get_regime_strategy_bias(regime_info)
-            trend_bias = get_trend_bias(window)
 
+            cur_dt = dt_series[i] if i < len(dt_series) else dt_series[-1]
+            df_confirm = df_confirm_all[df_confirm_all.index <= cur_dt].copy()
+            df_trend = df_trend_all[df_trend_all.index <= cur_dt].copy()
+            # Strip datetime index to match live pipeline expectations
+            df_confirm = df_confirm.reset_index(drop=True)
+            df_trend = df_trend.reset_index(drop=True)
+
+            trend_bias = get_trend_bias(df_trend)
             signals = collect_signals(window, regime_weights)
-            agg = aggregate_signals(signals, regime_weights, trend_bias, True)
 
-            direction = agg["direction"]
+            prelim = aggregate_signals(signals, regime_weights, trend_bias, True)
+            direction = prelim["direction"]
+
+            if direction is not None:
+                confirm_ok = check_confirmation_tf(df_confirm, direction)
+                agg = aggregate_signals(signals, regime_weights, trend_bias, confirm_ok)
+                direction = agg["direction"]
+
             if direction is not None:
                 atr = compute_atr(window, config.ATR_PERIOD)
                 atr_val = float(atr.iloc[-1]) if not np.isnan(atr.iloc[-1]) else 0
