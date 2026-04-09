@@ -17,6 +17,7 @@ Run: python bot.py
 
 import time
 import logging
+import os
 from datetime import datetime, date, timezone
 
 import config
@@ -41,12 +42,23 @@ except Exception:
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
+def _bot_log_file() -> str:
+    override = (os.getenv("BOT_LOG_FILE") or "").strip()
+    if override:
+        return override
+    try:
+        uid = int(os.getenv("BOT_USER_ID") or 0)
+    except Exception:
+        uid = 0
+    return f"bot_{uid}.log" if uid > 0 else "bot.log"
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(open(1, 'w', encoding='utf-8', closefd=False)),
-        logging.FileHandler("bot.log", encoding="utf-8"),
+        logging.FileHandler(_bot_log_file(), encoding="utf-8"),
     ],
 )
 log = logging.getLogger("delta_bot")

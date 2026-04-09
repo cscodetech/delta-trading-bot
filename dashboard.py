@@ -264,7 +264,7 @@ class AutoCloseMonitor:
 
         # Safety: never fight the main bot process
         try:
-            if globals().get("bot_mgr") and bot_mgr.running:
+            if globals().get("bot_mgr") and bot_mgr.is_running(self.user_id):
                 return
         except Exception:
             pass
@@ -342,75 +342,128 @@ monitor = AutoCloseMonitor()
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class BotManager:
-    """Manages the bot.py trading process."""
+    """Manages bot.py trading processes per user."""
 
     def __init__(self):
-        self.process: subprocess.Popen | None = None
-        self.started_at: str = ""
-        self.user_id: int = 0
-        self.started_by_user_id: int = 0
-        self.started_by_username: str = ""
-        self.max_trades_per_day: int = config.MAX_TRADES_PER_DAY
+        self._bots: dict[int, dict] = {}
+        self._lock = threading.Lock()
 
     @property
     def running(self) -> bool:
-        return self.process is not None and self.process.poll() is None
+        """True if any user bot is running."""
+        with self._lock:
+            self._cleanup_locked()
+            return any(b.get("process") is not None and b["process"].poll() is None for b in self._bots.values())
+
+    def _cleanup_locked(self):
+        dead = []
+        for uid, b in self._bots.items():
+            p = b.get("process")
+            if p is None:
+                dead.append(uid)
+            elif p.poll() is not None:
+                dead.append(uid)
+        for uid in dead:
+            try:
+                self._bots.pop(uid, None)
+            except Exception:
+                pass
+
+    def _log_file_for_user(self, user_id: int) -> str:
+        uid = int(user_id or 0)
+        return os.path.join(os.path.dirname(__file__), f"bot_{uid}.log")
+
+    def is_running(self, user_id: int) -> bool:
+        uid = int(user_id or 0)
+        with self._lock:
+            self._cleanup_locked()
+            b = self._bots.get(uid)
+            if not b:
+                return False
+            p = b.get("process")
+            return p is not None and p.poll() is None
+
+    def info(self, user_id: int) -> dict:
+        uid = int(user_id or 0)
+        with self._lock:
+            self._cleanup_locked()
+            return dict(self._bots.get(uid) or {})
 
     def start(self, user_id: int, started_by_username: str = ""):
-        if self.running:
+        uid = int(user_id or 0)
+        if uid <= 0:
             return
-        self.user_id = int(user_id or 0)
-        self.started_by_user_id = int(user_id or 0)
-        self.started_by_username = started_by_username or ""
-        bot_script = os.path.join(os.path.dirname(__file__), "bot.py")
-        env = os.environ.copy()
-        env["BOT_USER_ID"] = str(self.user_id)
-        env["PYTHONUNBUFFERED"] = "1"
-        self.process = subprocess.Popen(
-            [sys.executable, bot_script],
-            cwd=os.path.dirname(__file__),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
-            if sys.platform == "win32" else 0,
-        )
-        self.started_at = datetime.now().strftime("%H:%M:%S")
-        log.info(f"Bot started (PID {self.process.pid})")
+        with self._lock:
+            self._cleanup_locked()
+            existing = self._bots.get(uid)
+            if existing:
+                p0 = existing.get("process")
+                if p0 is not None and p0.poll() is None:
+                    return
 
-    def stop(self):
-        if not self.running:
+            bot_script = os.path.join(os.path.dirname(__file__), "bot.py")
+            env = os.environ.copy()
+            env["BOT_USER_ID"] = str(uid)
+            env["PYTHONUNBUFFERED"] = "1"
+            env["BOT_LOG_FILE"] = self._log_file_for_user(uid)
+            p = subprocess.Popen(
+                [sys.executable, bot_script],
+                cwd=os.path.dirname(__file__),
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                if sys.platform == "win32" else 0,
+            )
+            started_at = datetime.now().strftime("%H:%M:%S")
+            self._bots[uid] = {
+                "process": p,
+                "started_at": started_at,
+                "user_id": uid,
+                "started_by_user_id": uid,
+                "started_by_username": started_by_username or "",
+            }
+            log.info(f"Bot started for user {uid} (PID {p.pid})")
+
+    def stop(self, user_id: int):
+        uid = int(user_id or 0)
+        if uid <= 0:
             return
-        log.info(f"Stopping bot (PID {self.process.pid})...")
-        try:
-            self.process.terminate()
-            self.process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            self.process.kill()
-            self.process.wait()
-        except Exception as e:
-            log.error(f"Failed to stop bot: {e}")
-        self.process = None
-        self.user_id = 0
-        self.started_by_user_id = 0
-        self.started_by_username = ""
-        log.info("Bot stopped")
+        with self._lock:
+            self._cleanup_locked()
+            b = self._bots.get(uid)
+            if not b:
+                return
+            p: subprocess.Popen | None = b.get("process")
+            if p is None or p.poll() is not None:
+                self._bots.pop(uid, None)
+                return
+            log.info(f"Stopping bot for user {uid} (PID {p.pid})...")
+            try:
+                p.terminate()
+                p.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.wait()
+            except Exception as e:
+                log.error(f"Failed to stop bot: {e}")
+            self._bots.pop(uid, None)
+            log.info(f"Bot stopped for user {uid}")
 
-    def get_recent_logs(self, lines: int = 50) -> list[str]:
-        """Read last N lines from bot.log."""
-        log_file = os.path.join(os.path.dirname(__file__), "bot.log")
+    def get_recent_logs(self, user_id: int, lines: int = 50) -> list[str]:
+        """Read last N lines from per-user bot log."""
+        uid = int(user_id or 0)
+        log_file = self._log_file_for_user(uid)
         if not os.path.exists(log_file):
-            return []
+            # Backward compatibility
+            legacy = os.path.join(os.path.dirname(__file__), "bot.log")
+            log_file = legacy if os.path.exists(legacy) else log_file
         try:
             with open(log_file, "r", encoding="utf-8", errors="replace") as f:
                 all_lines = f.readlines()
             return [l.rstrip() for l in all_lines[-lines:]]
         except Exception:
             return []
-
-    def get_today_trade_count(self) -> int:
-        """Count trades closed today for the bot's current user_id."""
-        return db.get_today_trade_count(user_id=self.user_id or None)
 
 
 bot_mgr = BotManager()
@@ -490,11 +543,24 @@ def api_status():
             )
         err = msg
 
-    bot_running_any = bool(bot_mgr.running)
-    bot_owner_user_id = bot_mgr.user_id if bot_running_any else None
-    bot_owner_username = bot_mgr.started_by_username if bot_running_any else ""
-    bot_for_current_user = bool(bot_running_any and int(bot_mgr.user_id or 0) == int(uid or 0))
-    bot_locked = bool(bot_running_any and (not bot_for_current_user) and (not current_is_admin()))
+    bot_running = bool(bot_mgr.is_running(uid))
+    bot_info = bot_mgr.info(uid) if bot_running else {}
+    bot_pid = None
+    try:
+        p = bot_info.get("process")
+        if p is not None and getattr(p, "pid", None):
+            bot_pid = int(p.pid)
+    except Exception:
+        bot_pid = None
+
+    # Per-user max trades/day (stored in user_settings)
+    mtpd = config.MAX_TRADES_PER_DAY
+    try:
+        raw = (db.get_user_setting(uid, "max_trades_per_day") or "").strip()
+        if raw:
+            mtpd = max(1, int(raw))
+    except Exception:
+        mtpd = config.MAX_TRADES_PER_DAY
 
     return jsonify({
         "balance": round(bal, 4),
@@ -513,16 +579,13 @@ def api_status():
         "sl_pct": monitor.sl_pct,
         "tp_pct": monitor.tp_pct,
         "testnet": _parse_bool(db.get_user_setting(uid, "testnet", "1") or "1"),
-        # Bot status is user-wise. Only the owner (or admin) sees it as "running" to avoid confusion.
-        "bot_running": bool(bot_for_current_user or (current_is_admin() and bot_running_any)),
-        "bot_running_any": bot_running_any,
-        "bot_locked": bot_locked,
-        "bot_started_at": bot_mgr.started_at,
-        "bot_pid": bot_mgr.process.pid if bot_mgr.running else None,
-        "bot_user_id": bot_owner_user_id,
-        "bot_started_by_user_id": bot_mgr.started_by_user_id,
-        "bot_started_by_username": bot_owner_username,
-        "max_trades_per_day": bot_mgr.max_trades_per_day,
+        "bot_running": bot_running,
+        "bot_started_at": bot_info.get("started_at", "") if bot_running else "",
+        "bot_pid": bot_pid,
+        "bot_user_id": int(uid),
+        "bot_started_by_user_id": bot_info.get("started_by_user_id") if bot_running else None,
+        "bot_started_by_username": bot_info.get("started_by_username") if bot_running else "",
+        "max_trades_per_day": int(mtpd),
         "today_trades": db.get_today_trade_count(user_id=uid),
         "user_id": uid,
         "username": session.get("username") or "",
@@ -703,20 +766,18 @@ def api_bot():
     uname = session.get("username") or ""
 
     if action == "start":
-        if bot_mgr.running:
-            return jsonify({"ok": False, "error": "Bot already running"}), 400
+        if bot_mgr.is_running(uid):
+            return jsonify({"ok": False, "error": "Bot already running for this user"}), 400
         if not (db.get_user_setting(uid, "api_key") and db.get_user_setting(uid, "api_secret")):
             return jsonify({"ok": False, "error": "Add API Key & Secret in Settings first"}), 400
         bot_mgr.start(uid, started_by_username=uname)
     elif action == "stop":
-        if bot_mgr.running and not (current_is_admin() or bot_mgr.started_by_user_id in (0, uid)):
-            return jsonify({"ok": False, "error": "Forbidden"}), 403
-        bot_mgr.stop()
+        if not bot_mgr.is_running(uid):
+            return jsonify({"ok": True, "running": False})
+        bot_mgr.stop(uid)
     elif action == "toggle":
-        if bot_mgr.running:
-            if not (current_is_admin() or bot_mgr.started_by_user_id in (0, uid)):
-                return jsonify({"ok": False, "error": "Forbidden"}), 403
-            bot_mgr.stop()
+        if bot_mgr.is_running(uid):
+            bot_mgr.stop(uid)
         else:
             if not (db.get_user_setting(uid, "api_key") and db.get_user_setting(uid, "api_secret")):
                 return jsonify({"ok": False, "error": "Add API Key & Secret in Settings first"}), 400
@@ -724,21 +785,30 @@ def api_bot():
     elif action == "update_settings":
         mtpd = data.get("max_trades_per_day")
         if mtpd is not None:
-            bot_mgr.max_trades_per_day = max(1, int(mtpd))
+            mtpd_val = max(1, int(mtpd))
             try:
-                db.set_user_setting(uid, "max_trades_per_day", str(bot_mgr.max_trades_per_day))
+                db.set_user_setting(uid, "max_trades_per_day", str(mtpd_val))
             except Exception:
                 pass
 
+    running = bool(bot_mgr.is_running(uid))
+    info = bot_mgr.info(uid) if running else {}
+    pid = None
+    try:
+        p = info.get("process")
+        if p is not None and getattr(p, "pid", None):
+            pid = int(p.pid)
+    except Exception:
+        pid = None
+
     return jsonify({
         "ok": True,
-        "running": bot_mgr.running,
-        "pid": bot_mgr.process.pid if bot_mgr.running else None,
-        "started_at": bot_mgr.started_at,
-        "max_trades_per_day": bot_mgr.max_trades_per_day,
-        "bot_user_id": bot_mgr.user_id,
-        "started_by_user_id": bot_mgr.started_by_user_id,
-        "started_by_username": bot_mgr.started_by_username,
+        "running": running,
+        "pid": pid,
+        "started_at": info.get("started_at", "") if running else "",
+        "bot_user_id": uid,
+        "started_by_user_id": info.get("started_by_user_id") if running else None,
+        "started_by_username": info.get("started_by_username") if running else "",
     })
 
 
@@ -746,7 +816,8 @@ def api_bot():
 @login_required
 def api_bot_logs():
     lines = request.args.get("lines", 50, type=int)
-    return jsonify(bot_mgr.get_recent_logs(min(lines, 200)))
+    uid = current_user_id()
+    return jsonify(bot_mgr.get_recent_logs(uid, min(lines, 200)))
 
 
 @app.route("/api/sync-trades", methods=["POST"])
@@ -1659,14 +1730,7 @@ async function refreshStatus() {
 
   // Bot controls
   const botBtn = $('bot-toggle');
-  const botLocked = !!s.bot_locked;
-  if (botLocked) {
-    botBtn.textContent = 'Bot Busy';
-    botBtn.className = 'btn btn-red btn-sm';
-    botBtn.disabled = true;
-    const by = s.bot_started_by_username ? ` by ${escapeHtml(s.bot_started_by_username)}` : '';
-    $('bot-status').innerHTML = `<span class="dot on"></span> Running${by} (locked)`;
-  } else if (s.bot_running) {
+  if (s.bot_running) {
     botBtn.textContent = 'Stop Bot';
     botBtn.className = 'btn btn-red btn-sm';
     botBtn.disabled = false;

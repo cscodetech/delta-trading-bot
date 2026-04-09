@@ -229,6 +229,14 @@ def _load_db_settings():
         if testnet_val in ("0", "1"):
             g["TESTNET"] = testnet_val == "1"
 
+        # Per-user max trades/day
+        try:
+            mtpd_val = (_db.get_setting("max_trades_per_day") or "").strip()
+            if mtpd_val:
+                g["MAX_TRADES_PER_DAY"] = max(1, int(mtpd_val))
+        except Exception:
+            pass
+
         # Re-derive TELEGRAM_ENABLED
         g["TELEGRAM_ENABLED"] = bool(g.get("TELEGRAM_TOKEN", ""))
 
